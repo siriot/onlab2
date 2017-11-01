@@ -1,0 +1,51 @@
+/ {
+	amba_pl: amba_pl {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges ;
+
+		fpga_virtual:fpga_virtual{
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges ;
+
+			fpga_virtual_slots:fpga_virtual_slots{
+				#address-cells = <1>;
+				#size-cells = <1>;
+				ranges ;
+
+					fpga_virtual_slot0:fpga_virtual_slot0&40400000{
+						reg = <0x40400000 0x4000>;
+						interrupt-parent = <&intc>;
+						interrupts = <0 61 4>, <0 62 4> , <0 63 4> ;
+					};
+
+					fpga_virtual_slot1:fpga_virtual_slot1&40500000{
+						reg = <0x40500000 0x4000>;
+						interrupt-parent = <&intc>;
+						interrupts = <0 64 4>, <0 65 4> , <0 66 4> ;
+					};
+			};
+
+			fpga_virtual_accels:fpga_virtual_accels{
+				#address-cells = <1>;
+				#size-cells = <1>;
+				ranges ;
+
+				fpga_virtual_accel_swapper:fpga_virtual_accel_swapper{
+					fpga_virtual_compatible_slots = < 0 1 >;
+					fpga_virtual_config_name = "accel_swapper";
+				};
+
+				fpga_virtual_accel_copy{
+					fpga_virtual_compatible_slots = < 0 1 >;
+					fpga_virtual_config_name = "accel_copy";
+				};
+			};
+
+		};
+		
+
+	};
+};
