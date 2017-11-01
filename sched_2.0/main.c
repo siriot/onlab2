@@ -10,6 +10,10 @@
  * 		- at module init slot address range should be checked, and should implement correct freeing mechanism
  *
  *
+ * TODO:
+ *  	Interrupt handling
+ *
+ *
  *
  *
  */
@@ -44,6 +48,10 @@
 
 #include <linux/dma-mapping.h>
 
+#include <linux/of_address.h>
+#include <linux/of_device.h>
+#include <linux/ioport.h>
+
 
 /* Resource locking policy:
  * event queue -> virt_dev -> slot
@@ -68,8 +76,16 @@ struct slot_info_t
 	struct virtual_dev_t *user;
 	int status;
 	struct dev_priv *actual_dev;
-	uint8_t *slot_kaddr;
 	uint8_t busy;
+
+	// slot virtual address
+	uint8_t *slot_kaddr;
+	// slot physical address range
+	uint32_t base_address;
+	uint32_t address_length;
+	// compatible accelerator list
+	uint32_t compatible_accel_num;
+	struct dev_priv **compatible_accels;
 };
 // Contains information about the device session.
 // This structure is linked to the file descriptor and thus to the session.
@@ -154,7 +170,7 @@ struct dev_dma_buffer_desc
  * lock policy: only kthread can get more than one spin lock, other threads may only get 1!
  */
 // global variables
-#define SLOT_NUM 2 // TODO CORE gather it form device tree
+//#define SLOT_NUM 2 // TODO CORE gather it form device tree
 
 // user interface
 	static struct miscdevice misc;
@@ -166,10 +182,6 @@ struct dev_dma_buffer_desc
 	DECLARE_COMPLETION(event_in);
 	static void add_event(struct user_event *e);
 
-// device database
-	unsigned device_num;
-	struct dev_priv *device_data;
-
 // scheduler thread
 	static uint8_t quit = 0;
 	DECLARE_COMPLETION(thread_stop);
@@ -177,10 +189,20 @@ struct dev_dma_buffer_desc
 
 //fpga manager data
 	static struct fpga_manager *mgr;
+
 // fpga slot data
 	DEFINE_SPINLOCK(slot_lock);
-	unsigned free_slot_num = SLOT_NUM;
-	struct slot_info_t slot_info[SLOT_NUM];
+	unsigned int SLOT_NUM;
+	unsigned free_slot_num;
+	struct slot_info_t *slot_info;
+
+// fpga accelerators data
+	unsigned device_num;
+	struct dev_priv *device_data; // pointer to the dev_priv array
+
+// device modell data
+	static struct device fpga_virtual_bus;
+	static struct device *devices;
 
 	
 	/***************************************
@@ -196,7 +218,25 @@ struct dev_dma_buffer_desc
 	static int dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc,struct slot_info_t *slot);
 	
 	
-	
+	// database builder functions
+	static int gather_slot_data(void);
+	static void free_slot_data(void);
+	static void print_slot_data(void)
+	static int gather_accel_data(void);
+	static void free_accel_data(void);
+
+	// fpga manager
+	static int connect_to_fpga_mgr(void);
+	static void disconnect_from_fpga_mgr(void);
+
+	// linux device modell functions
+	static int build_device_modell(void);
+	static void clean_device_modell(void);
+
+	// procfs interface
+	static int procfs_init(void);
+	static void procfs_destroy(void);
+
 	
 	
 	//------------------------------------------------------------//
@@ -452,14 +492,7 @@ static int sched_thread_fn(void *data)
 static int build_device_database(void);
 static void free_device_database(void);
 
-#define PROCFS_NAME "fpga_mgr"
-static struct proc_dir_entry *proc_file;
-ssize_t procfile_read(struct file *file, char __user *buffer, size_t bufsize, loff_t * offset);
-static struct file_operations proc_fops =
-{
-		.owner = THIS_MODULE,
-		.read = procfile_read
-};
+
 
 
 // user interface
@@ -816,18 +849,18 @@ static int dev_close (struct inode *inode, struct file *pfile)
 	}
 	
 	struct dev_dma_buffer_desc
-{
-	uint32_t ref_cntr;
-	struct spinlock lock;
-	uint32_t dma_addr;
-	uint8_t *kaddr;
-	uint32_t length;
-	
-	uint32_t tx_base;
-	uint32_t tx_length;
-	uint32_t rx_base;
-	uint32_t rx_length;
-}
+	{
+		uint32_t ref_cntr;
+		struct spinlock lock;
+		uint32_t dma_addr;
+		uint8_t *kaddr;
+		uint32_t length;
+		
+		uint32_t tx_base;
+		uint32_t tx_length;
+		uint32_t rx_base;
+		uint32_t rx_length;
+	};
 
 static int dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc, struct slot_info_t *slot)
 {
@@ -920,22 +953,45 @@ static struct file_operations dev_fops =
 };
 
 
-// accelerator interface offset addresses
-#define SLOT_0_BASE						(0x40400000U)
-#define SLOT_1_BASE						(0x40500000U)
-static uint32_t slot_base_addresses = {SLOT_0_BASE, SLOT_1_BASE};
 
-#define SLOT_ADDRESS_RANGE_LENGTH		(0x4000U)
+/* 	************************************************************************
+	************************************************************************
+	****					MODULE INIT / EXIT							****
+	************************************************************************
+	************************************************************************
+*/
 static int fpga_sched_init(void)
 {
-	int ret ;
+	int ret;
 	int i;
 	pr_info("Starting fpga scheduler module.\n");
 
+	if(build_device_modell())
+	{
+		pr_err("Cannot build device modell.\n");
+		goto err;
+	}
+
 	// build database
-	ret = build_device_database();
-	if(ret)
-		return ret;
+	if(gather_slot_data())
+	{
+		pr_err("Failed to init slot data.\n");
+		goto err1;
+	}
+
+	if(gather_accel_data())
+	{
+		pr_err("Failed to load accel data.\n");
+		goto err2;
+	}
+
+	if(connect_to_fpga_mgr())
+	{
+		pr_err("Cannot init fpga manager.\n");
+		goto err3;
+	}
+
+
 	// register misc device in the system
 	misc.fops = &dev_fops;
 	misc.minor = MISC_DYNAMIC_MINOR;
@@ -943,7 +999,7 @@ static int fpga_sched_init(void)
 	if(misc_register(&misc))
 	{
 		pr_warn("Couldn't initialize miscdevice /dev/fpga_mgr.\n");
-		goto err1;
+		goto err4;
 	}
 	pr_info("Misc device initialized: /dev/fpga_mgr.\n");
 
@@ -952,61 +1008,511 @@ static int fpga_sched_init(void)
 	if(IS_ERR(sched_thread))
 	{
 		pr_err("Scheduler thread failed to start.\n");
-		goto err2;
+		goto err5;
 	}
 
-	// Allocating io memory range
-	request_mem_region(slot_base_addresses[0],SLOT_ADDRESS_RANGE_LENGTH,"ACCEL 0 slot");
-	request_mem_region(slot_base_addresses[1],SLOT_ADDRESS_RANGE_LENGTH,"ACCEL 1 slot");
-		// Remapping io region to the kernel address space
-		slot_info[0].slot_kaddr = (uint8_t*)ioremap(slot_base_addresses[0],SLOT_ADDRESS_RANGE_LENGTH);
-		slot_info[1].slot_kaddr = (uint8_t*)ioremap(slot_base_addresses[1],SLOT_ADDRESS_RANGE_LENGTH);
-	if(slot_info[0].slot_kaddr==NULL || slot_info[1].slot_kaddr==NULL)
-	{
-		pr_error("Cannot remap slot address region.\n");
-		goto err2;
-	}
-	
-	// Initing slot_info variables
-	for(i=0;i<SLOT_NUM;i++)
-	{
-		slot_info[i].status = SLOT_FREE;
-		slot_info[i].user = NULL;
-		slot_info[i].actual_dev = NULL;
-		slot_info[i].busy = 0;
-	}
 
-	// register procfs interface
-	proc_file = proc_create(PROCFS_NAME,0444,NULL,&proc_fops);
+	procfs_init();
 
 	return 0;
-	err2:
+	err5:
 		misc_deregister(&misc);
+	err4:
+		disconnect_from_fpga_mgr();
+	err3:
+		free_accel_data();
+	err2:
+		free_slot_data();
 	err1:
+		clean_device_modell();
+	err:
 	return -1;
 }
 
 static void fpga_sched_exit(void)
 {
-	// unregister procfs interface
-	proc_remove(proc_file);
-	// Releasing slot memory regions
-	iounmap(slot_info[0].slot_kaddr);
-	iounmap(slot_info[1].slot_kaddr);
-	release_mem_region(slot_base_addresses[0],SLOT_ADDRESS_RANGE_LENGTH);
-	release_mem_region(slot_base_addresses[1],SLOT_ADDRESS_RANGE_LENGTH);
-	// deregister misc device
-		misc_deregister(&misc);
 	//send stop signal to the kernel thread
 	quit = 1;
 	complete(&event_in);
 	wait_for_completion(&thread_stop);
 
-	free_device_database();
+	procfs_destroy();
+	misc_deregister();
+	disconnect_from_fpga_mgr();
+	free_accel_data();
+	free_slot_data();
+	clean_device_modell();
 	pr_info("Fpga scheduler module exited.\n");
 }
 
+
+/* ======================================================================== 
+					LINUX DEVICE MODELL HANDLER
+
+	static int build_device_modell(void);
+	static void clean_device_modell(void);
+   ========================================================================*/
+
+
+static int fpga_virtual_bus_match(struct device *dev, struct device_driver *drv)
+{
+	if(dev->bus == &fpga_virtual_bus_type) return 1;
+	return 0;
+}
+
+static struct bus_type fpga_virtual_bus_type =
+{
+		.name="fpga_virtual_bus",
+		.match = fpga_virtual_bus_match
+};
+
+
+// BUS DRIVER
+static int fpga_virtual_driver_probe(struct device *dev)
+{
+	if(dev->bus == &fpga_virtual_bus_type) return 1;
+	return 0;
+}
+static struct device_driver fpga_virtual_driver =
+{
+		.name = "fpga_virtual_driver",
+		.bus = &fpga_virtual_bus_type,
+		.owner = THIS_MODULE,
+		.probe = fpga_virtual_driver_probe
+};
+
+// DEVICE ATTRIBUTE
+static ssize_t id_show (struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct dev_priv *p = (struct dev_priv*)dev_get_drvdata(dev);
+	return sprintf(buf,"%d",p->acc_id);
+}
+DEVICE_ATTR(id,0444,id_show,NULL);
+
+static int build_device_modell(void)
+{
+	int ret = 0;
+
+	// registering fpga virtual bus
+	if(bus_register(&fpga_virtual_bus_type))
+	{
+		pr_err("Cannot register fpga_virtual bus.\n");
+		ret = -ENODEV;
+		goto err;
+	}
+
+	// register fpga_virtual_bus device
+	//fpga_virtual_bus.of_node = base;
+	dev_set_name(&fpga_virtual_bus,"fpga_virtual_bus_device");
+	if(device_register(&fpga_virtual_bus))
+	{
+		pr_err("Cannot register fpga_virtual_bus device.\n");
+		ret = -ENODEV;
+		goto err1;
+	}
+
+	// register fpga virtual bus driver
+	if(driver_register(&fpga_virtual_driver))
+	{
+		pr_err("Cannot register fpga_virutal driver.\n");
+		ret = -1;
+		goto err2;
+	}
+
+	return 0;
+
+err2:
+	device_unregister(&fpga_virtual_bus);
+err1:
+	bus_unregister(&fpga_virtual_bus_type);
+err:
+	return ret;
+}
+
+static void clean_device_modell(void)
+{
+	driver_unregister(&fpga_virtual_driver);
+	device_unregister(&fpga_virtual_bus);
+	bus_unregister(&fpga_virtual_bus_type);	
+}
+
+/* ======================================================================== 
+							SLOT DATA MANAGER
+
+	static int gather_slot_data(void);
+	static void free_slot_data(void);
+	static void print_slot_data(void);
+   ========================================================================*/
+/* Target global variables:
+	DEFINE_SPINLOCK(slot_lock);
+	unsigned int SLOT_NUM;
+	unsigned free_slot_num;
+	struct slot_info_t *slot_info;
+	*/
+static int gather_slot_data(void)
+{
+	struct device_node *base;
+	struct device_node *slot;
+	struct resource res;
+	int i;
+	int slot_no;
+	void *slot_kaddr;
+	int ok;
+
+	// initialize slot database
+	SLOT_NUM = 0;
+	free_slot_num = 0;
+	slot_info = NULL;
+
+	ret = 0;
+
+	// search the device tree for the data
+	base = of_find_node_by_name(NULL,"fpga_virtual_slots");
+	if(!base)
+	{
+		pr_err("FPGA_VIRTUAL_SLOTS node not found. Terminating...\n");
+		ret = -1;
+		goto err0;
+	}
+	
+	// COUNTING SLOTS
+	slot_no = of_get_child_count(base);
+	if(slot_no < 1)
+	{
+		pr_err("No slots found.\n");
+		ret = -ENODEV;
+		goto err1;
+	}
+	pr_info("%d slots found.\n",SLOT_NUM);
+
+	// allocate memory for the slot info structures
+	slot_info = (struct slot_info_t*)kmalloc(sizeof(struct slot_info_t) * slot_no, GFP_KERNEL);
+	if(!slot_info)
+	{
+		pr_err("Cannot allocate memory for the slot descriptors.\n");
+		ret = -ENOMEM;
+		goto err1;
+	}
+
+
+	// ACQUIRING SLOT PARAMETERS (static fpga region data) from the device tree
+	i=0;
+	for_each_child_of_node(base,slot)
+	{
+		ok = 0;
+		// allocate static region addresses for the slot
+		if(of_address_to_resource(slot,0,&res))
+		{
+
+			if(request_mem_region(res.start, resource_size(&res), "FPGA ACCELERATOR SLOT") != NULL)
+			{
+				slot_kaddr = of_iomap(slot,0);
+				if(slot_kaddr)
+				{
+					// address mapping succeded
+					slot_info[i].base_address = res.start;
+					slot_info[i].address_length = resource_size(&res);
+					slot_info[i].slot_kaddr = slot_kaddr;
+					ok = 1;
+				}
+				else
+					release_mem_region(res.start, resource_size(&res));
+			}	
+		}
+			// check for success
+			if(!ok)
+			{
+				pr_err("Cannot acquire slot %d base address.\n",i);
+				slot_info[i].base_address = 0;
+				slot_info[i].address_length = 0;
+				slot_info[i].slot_kaddr = NULL;
+				ret = -1;
+			}
+
+		slot_info[i].user = NULL;
+		slot_info[i].status = SLOT_FREE;
+		slot_info[i].actual_dev = NULL;
+		slot_info[i].busy = 0;
+		slot_info[i].compatible_accel_num = 0;
+		slot_info[i].compatible_accels = NULL;
+			i++;
+	} //foreach
+
+
+	// Exporting SLOT counter
+
+	free_slot_num = SLOT_NUM = slot_no;
+
+	err1:
+		of_node_put(base);
+	err0:
+		return ret;
+}
+
+static void free_slot_data(void)
+{
+	int i;
+
+	// FREE interrupt lines
+
+	// FREE address mappings
+	for(i=0;i<SLOT_NUM;i++)
+	{
+		if(slot_info[i].slot_kaddr)
+		{
+			iounmap(slot_info[i].kaddr);
+			release_mem_region(slot_info[i].base_address, slot_info[i].address_length);
+		}
+		if(slot_info[i].compatible_accels != NULL)
+			kfree(slot_info[i].compatible_accels);
+	}
+
+	kfree(slot_info);
+}
+
+static void print_slot_data(void)
+{
+	int i,j;
+	for(i=0;i<SLOT_NUM;i++)
+	{
+		printk("Slot no: %d,\tslot base address: 0x%08x,\tslot address length: 0x%x,associated accel num: %d.\n",i,slot_info[i].base_address, slot_info[i].address_length, slot_info[i].compatible_accel_num);
+		for(j=0;j<slot_info[i].compatible_accel_num;j++)
+			printk("Slot no --%d-- is compatible with accel --%d--.\n",i,slot_info[i].compatible_accels[j]->acc_id);
+		printk("There are %d slots and %d accelerators in the system.\n",SLOT_NUM,device_num);
+	}
+}
+
+/* ======================================================================== 
+							ACCELERATORS MANAGER
+
+	static int gather_accel_data(void);
+	static void free_accel_data(void);
+   ========================================================================*/
+
+static int gather_accel_data(void)
+{
+	struct device_node *base;
+	struct device_node *acc;
+	int i,j;
+	int ret;
+	uint32_t accel_num;
+	uint8_t *text_prop;
+	uint32_t *word_prop;
+	int prop_len;
+	uint8_t name_buf[64] = {0};
+
+	
+	// init the global variables
+	device_num = 0;
+	device_data = NULL;
+	devices = NULL
+
+	base = of_find_node_by_name(NULL,"fpga_virtual_accels");
+	if(!base)
+	{
+		pr_err("FPGA_VIRTUAL_ACCELS node not found. Terminating...\n");
+		ret = -1;
+		goto err;
+	}
+
+
+	accel_num = of_get_child_count(base);
+	if(accel_num<1)
+	{
+		pr_err("No accelerators found.\n");
+		ret = -ENODEV;
+		goto err1;
+	}
+	pr_info("%d accelerators found.\n",accel_num);	
+
+
+	// allocate structures for all the dev_privs
+	device_data = (struct dev_priv*)kmalloc(device_num*sizeof(struct dev_priv),GFP_KERNEL);
+	if(!device_data)
+	{
+		ret = -ENOMEM;
+		goto err1;
+	}
+	// allocate device_data
+	devices = (struct device*)kzalloc(device_num*sizeof(struct device),GFP_KERNEL);
+	if(!devices)
+	{
+		ret = -ENOMEM;
+		goto err2;
+	}
+
+	// build compatible accel database for the slots
+	for(i=0;i<SLOT_NUM;i++)
+	{
+		slot_info[i].compatible_accels = (struct dev_priv**)kmalloc(accel_num* sizeof(struct dev_priv*));
+		if(slot_info[i].compatible_accels == NULL)
+		{
+			pr_err("Cannot allocate memory for compatible accel list.\n");
+			continue;
+		}
+	}
+
+	// iterate over the child nodes, and fill the corresponing structures
+	i=0;
+	for_each_child_of_node(base,acc)
+	{
+		// get accel name property
+		text_prop = of_get_property(acc,"fpga_virtual_config_name",&prop_len);
+		if(text_prop==NULL || prop_len==0)
+		{
+			pr_err("Cannot get accelerator name.\n");
+			dev_set_name(&devices[i],"%s",acc->name);
+		}
+		else
+		{
+			strncpy(name_buf, text_prop, 63);
+			dev_set_name(&devices[i],"%s",name_buf);
+		}
+
+		// get compatible slot list
+		word_prop = of_get_property(acc,"fpga_virtual_compatible_slots",&prop_len);
+		if(word_prop==NULL || prop_len==0)
+		{
+			pr_err("Cannot get compatible slot no.\n");
+		}
+		else
+		{
+			// iterate over the compatible slots
+			pr_info("Compatible slot count: %d.\n",prop_len);
+			for(j=0;j<prop_len;j++)
+			{
+				uint32_t slot_index = word_prop[j];
+				pr_info("Accel %d is compatible with slot %d.\n",i,slot_index);
+
+				if(slot_index < SLOT_NUM)
+				{
+					uint32_t idx = slot_info[slot_index].compatible_accel_num;
+					slot_info[slot_index].compatible_accels[idx] = &device_data[i];
+					slot_info[slot_index].compatible_accel_num++;
+				}
+				else
+				{
+					pr_err("Invalid slot index: %d",slot_index);
+				}
+			}
+		}
+
+		devices[i].bus = &fpga_virtual_bus_type;
+		devices[i].driver = &fpga_virtual_driver;
+		devices[i].of_node = acc;
+		of_node_get(acc);
+		devices[i].parent = &fpga_virtual_bus;
+		if(device_register(&devices[i]))
+		{
+			pr_err("Unable to register device.\n");
+		}
+
+		device_data[i].acc_id = i;
+		INIT_LIST_HEAD(&(device_data[i].active_list));
+		INIT_LIST_HEAD(&(device_data[i].waiters));
+		device_data[i].dev = &devices[i];
+
+		dev_set_drvdata(&devices[i],(void*)&device_data[i]);
+
+		// add device attribute
+		device_create_file(&devices[i],&dev_attr_id);
+		i++;
+	}
+
+	of_node_put(base);
+	// export data
+	device_num = accel_num;
+	return 0;
+
+	err3:
+	kfree(devices);
+	err2:
+	kfree(device_data);
+	err1:
+	of_node_put(base);
+	err:
+	return ret;
+
+}
+
+static void free_accel_data(void)
+{
+	int i;
+	/*
+	// TODO SAFETY wake all waiting processes
+	*/
+	for(i=0;i<device_num;i++)
+	{
+		device_remove_file(&devices[i],&dev_attr_id);
+		of_node_put(devices[i].of_node);
+		device_unregister(&devices[i]);
+	}
+
+	kfree(device_data);
+	kfree(devices);
+
+}
+
+
+/* ======================================================================== 
+							FPGA MGR ADAPTER
+
+	static int connet_to_fpga_mgr(void);
+	static void disconnet_from_fpga_mgr(void);
+   ========================================================================*/
+
+static int connect_to_fpga_mgr(void)
+{
+	struct device_node *devcfg;
+	int ret = 0;
+
+	// find devcfg device
+	devcfg = of_find_node_by_name(NULL,"devcfg");
+	if(!devcfg)
+	{
+		pr_err("Can't find devcfg node in device tree.\n");
+		ret = -ENODEV;
+		goto err;
+	}
+	mgr = of_fpga_mgr_get(devcfg);
+	of_node_put(devcfg);
+	if(IS_ERR(mgr))
+	{
+		pr_err("Cannot get fpga manager.\n");
+		ret = -ENODEV;
+	}
+err:
+	return ret;
+}
+
+static void disconnect_from_fpga_mgr(void)
+{
+	fpga_mgr_put(mgr);
+}
+
+
+/* ======================================================================== 
+							PROCFS INTERFACE
+
+	static int build_device_modell(void);
+	static void clean_device_modell(void);
+   ========================================================================*/
 // procfs interface for slot status observation
+
+#define PROCFS_NAME "fpga_mgr"
+static struct proc_dir_entry *proc_file;
+static struct file_operations proc_fops;
+
+static int procfs_init(void)
+{
+	// register procfs interface
+	proc_file = proc_create(PROCFS_NAME,0444,NULL,&proc_fops);
+	return 0;
+}
+static void procfs_destroy(void)
+{
+	proc_remove(proc_file);
+}
 
 char log_buf[256];
 ssize_t procfile_read(struct file *file, char __user *buffer, size_t bufsize, loff_t * offset)
@@ -1031,225 +1537,11 @@ ssize_t procfile_read(struct file *file, char __user *buffer, size_t bufsize, lo
 	return len;
 }
 
-///////////////////////////////
-//// VIRTUAL BUS
-///////////////////////////////
-
-static int fpga_virtual_bus_match(struct device *dev, struct device_driver *drv);
-
-static struct bus_type fpga_virtual_bus_type =
+static struct file_operations proc_fops =
 {
-		.name="fpga_virtual_bus",
-		.match = fpga_virtual_bus_match
-};
-
-static int fpga_virtual_bus_match(struct device *dev, struct device_driver *drv)
-{
-	if(dev->bus == &fpga_virtual_bus_type) return 1;
-	return 0;
-}
-
-
-// BUS DEVICE
-static struct device fpga_virtual_bus;
-
-// BUS DRIVER
-static int fpga_virtual_driver_probe(struct device *dev)
-{
-	if(dev->bus == &fpga_virtual_bus_type) return 1;
-	return 0;
-}
-static struct device_driver fpga_virtual_driver =
-{
-		.name = "fpga_virtual_driver",
-		.bus = &fpga_virtual_bus_type,
 		.owner = THIS_MODULE,
-		.probe = fpga_virtual_driver_probe
+		.read = procfile_read
 };
-
-// DEVICE ATTRIBUTE
-static struct device *devices;
-static ssize_t id_show (struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct dev_priv *p = (struct dev_priv*)dev_get_drvdata(dev);
-	return sprintf(buf,"%d",p->acc_id);
-}
-DEVICE_ATTR(id,0444,id_show,NULL);
-
-static int build_device_database(void)
-{
-	struct device_node *base;
-	struct device_node *acc;
-	struct device_node *devcfg;
-	int i;
-	int ret;
-
-	// init fpga_manager module
-	// find devcfg device
-	devcfg = of_find_node_by_name(NULL,"devcfg");
-	if(!devcfg)
-	{
-		pr_err("Can't find devcfg node in device tree.\n");
-		ret = -ENODEV;
-		goto err_1;
-	}
-	mgr = of_fpga_mgr_get(devcfg);
-	of_node_put(devcfg);
-	if(IS_ERR(mgr))
-	{
-		pr_err("Cannot get fpga manager.\n");
-		ret = -ENODEV;
-		goto err_1;
-	}
-
-
-	//search  for the fpga_virtual node in the device tree
-	base = of_find_node_by_name(NULL,"fpga_virtual");
-	if(!base)
-	{
-		pr_err("FPGA_VIRTUAL node not found. Terminating...\n");
-		ret = -1;
-		goto err0;
-	}
-	// count existent accelerators
-
-	device_num = of_get_child_count(base);
-	if(device_num==0)
-	{
-		pr_err("No accelerators found.\n");
-		ret = -ENODEV;
-		goto err1;
-	}
-	pr_info("%d accelerators found.\n",device_num);
-
-	// registering fpga virtual bus
-	if(bus_register(&fpga_virtual_bus_type))
-	{
-		pr_err("Cannot register fpga_virtual bus.\n");
-		ret = -ENODEV;
-		goto err1;
-	}
-
-	// register fpga virtual bus driver
-	if(driver_register(&fpga_virtual_driver))
-	{
-		pr_err("Cannot register fpga_virutal driver.\n");
-		ret = -1;
-		goto err2;
-	}
-
-	// allocate structures for all the dev_privs
-	device_data = (struct dev_priv*)kmalloc(device_num*sizeof(struct dev_priv),GFP_KERNEL);
-	if(!device_data)
-	{
-		ret = -ENOMEM;
-		goto err4;
-	}
-	// allocate device_data
-	devices = (struct device*)kzalloc(device_num*sizeof(struct device),GFP_KERNEL);
-	if(!devices)
-	{
-		ret = -ENOMEM;
-		goto err5;
-	}
-
-	// register fpga_virtual_bus device
-	fpga_virtual_bus.of_node = base;
-	dev_set_name(&fpga_virtual_bus,"fpga_virtual_bus_device");
-	if(device_register(&fpga_virtual_bus))
-	{
-		pr_err("Cannot register fpga_virtual_bus device.\n");
-		ret = -ENODEV;
-		goto err6;
-	}
-
-	// associate structures
-	i=0;
-	for_each_child_of_node(base,acc)
-	{
-		devices[i].bus = &fpga_virtual_bus_type;
-		devices[i].driver = &fpga_virtual_driver;
-		devices[i].of_node = acc;
-		of_node_get(acc);
-		devices[i].parent = &fpga_virtual_bus;
-		dev_set_name(&devices[i],"%s",acc->name);
-		if(device_register(&devices[i]))
-		{
-			pr_err("Unable to register device.\n");
-		}
-
-		device_data[i].acc_id = i;
-		INIT_LIST_HEAD(&(device_data[i].active_list));
-		INIT_LIST_HEAD(&(device_data[i].waiters));
-		device_data[i].dev = &devices[i];
-
-		dev_set_drvdata(&devices[i],(void*)&device_data[i]);
-
-		// add device attribute
-		device_create_file(&devices[i],&dev_attr_id);
-		i++;
-	}
-	/*
-	int i;
-
-	device_data = (struct dev_priv*)kmalloc(DEV_NUM*sizeof(struct dev_priv),GFP_KERNEL);
-
-	for(i=0;i<DEV_NUM;i++)
-	{
-		device_data[i].acc_id = i;
-		device_data[i].pdev = NULL;
-		INIT_LIST_HEAD(&(device_data[i].active_list));
-		INIT_LIST_HEAD(&(device_data[i].waiters));
-	}
-	device_num = DEV_NUM;
-	 * */
-	return 0;
-
-	err6:
-	kfree(devices);
-	err5:
-	kfree(device_data);
-	err4:
-	driver_unregister(&fpga_virtual_driver);
-	err2:
-	bus_unregister(&fpga_virtual_bus_type);
-	err1:
-	of_node_put(base);
-	err0:
-	fpga_mgr_put(mgr);
-	err_1:
-	pr_err("Error code: %d.\n",ret);
-	return ret;
-
-}
-
-static void free_device_database(void)
-{
-	int i;
-	/*
-	// TODO SAFETY wake all waiting processes
-	*/
-	for(i=0;i<device_num;i++)
-	{
-		device_remove_file(&devices[i],&dev_attr_id);
-		of_node_put(devices[i].of_node);
-		device_unregister(&devices[i]);
-	}
-	of_node_put(fpga_virtual_bus.of_node);
-	device_unregister(&fpga_virtual_bus);
-
-	driver_unregister(&fpga_virtual_driver);
-
-	/// unregister bus type
-	bus_unregister(&fpga_virtual_bus_type);
-
-	kfree(device_data);
-	kfree(devices);
-
-	fpga_mgr_put(mgr);
-
-	
-}
 
 
 

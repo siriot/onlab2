@@ -15,13 +15,13 @@
 				#size-cells = <1>;
 				ranges ;
 
-					fpga_virtual_slot0:fpga_virtual_slot0&40400000{
+					fpga_virtual_slot0:fpga_virtual_slot0@40400000{
 						reg = <0x40400000 0x4000>;
 						interrupt-parent = <&intc>;
 						interrupts = <0 61 4>, <0 62 4> , <0 63 4> ;
 					};
 
-					fpga_virtual_slot1:fpga_virtual_slot1&40500000{
+					fpga_virtual_slot1:fpga_virtual_slot1@40500000{
 						reg = <0x40500000 0x4000>;
 						interrupt-parent = <&intc>;
 						interrupts = <0 64 4>, <0 65 4> , <0 66 4> ;
