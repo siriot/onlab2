@@ -54,7 +54,8 @@
 
 
 /* Resource locking policy:
- * event queue -> virt_dev -> slot
+	// dev_close
+ * virt_dev -> event queue -> slot
  * Locking may only happen in this direction. !!!
  *
  * if vdev->status == OPERATING && vdev->slot->status == OPERATING than the pairing is guaratied!!!
@@ -165,6 +166,7 @@ struct dev_dma_buffer_desc
 	uint32_t rx_length;
 }
 	
+#define FPGA_STATIC_CONFIG_NAME "static.bit"
 
 /**
  * lock policy: only kthread can get more than one spin lock, other threads may only get 1!
@@ -256,7 +258,7 @@ static int lock_operating_vdev(struct virtual_dev_t *vdev)
 		}
 	}
 	else
-		spin_unlock(&(vdev->status_lock);
+		spin_unlock(&(vdev->status_lock));
 	return -1;
 }
 
@@ -295,12 +297,51 @@ static struct user_event* get_event(void)
 	return ue;
 }
 
-static int program_slot(int acc_id)
+static int program_fpga(const char *name)
 {
+	uint32_t ret;
+	// load the fpga with the static configuration
+	ret = fpga_mgr_firmware_load(mgr, 0, name);
+	if(ret)
+		pr_err("Cannot initialize static fpga_region.\n");
+	return ret;
+}
+static int program_slot(int slot_num, int acc_id)
+{
+	uint32_t tmp;
+	int ret;
+
+	if(slot_num < 0 || slot_num >= SLOT_NUM) return -1;
+	// stop the previous accelerator
+	// reset accelerator
+	iowrite8(1,slot_info[slot_num].slot_kaddr + AXI_RST_BASE_OFFSET);
+	// decouple accelerator
+	iowrite8(1, slot_info[slot_num].slot_kaddr + AXI_DECOUPLER_BASE_OFFSET);
+	// reset TX and RX DMA channels
+	tmp = ioread32(slot_info[slot_num].slot_kaddr + AXI_DMA_TX_OFFSET + AXI_DMA_CONTROL_OFFSET);
+	tmp |= (1<<2); // Set Reset bit in the control register
+	iowrite32(tmp,slot_info[slot_num].slot_kaddr + AXI_DMA_TX_OFFSET + AXI_DMA_CONTROL_OFFSET);
+
+
 	static char name[100];
 	snprintf(name,100,"%s.bit",device_data[acc_id].dev->of_node->name);
+	// start programming
 	pr_info("Loading configuration: %s - id :%d.\n",name,acc_id);
-	return fpga_mgr_firmware_load(mgr,0,name);
+	ret = fpga_mgr_firmware_load(mgr, FPGA_MGR_PARTIAL_RECONFIG, name);
+	pr_info("FPGA configuration finished.\n");
+	if(ret)
+	{
+		pr_err("FPGA config failed...\n");
+	}
+	else
+	{
+		// starting the new accelerator
+		// clear decoupling
+		iowrite8(0, slot_info[slot_num].slot_kaddr + AXI_DECOUPLER_BASE_OFFSET);
+		// clear reset signal
+		iowrite8(0,slot_info[slot_num].slot_kaddr + AXI_RST_BASE_OFFSET);
+	}
+	return ret;
 }
 static void hw_schedule(void)
 {
@@ -330,11 +371,11 @@ static void hw_schedule(void)
 					spin_lock(&slot_lock);
 					slot_info[i].status = SLOT_USED;
 					slot_info[i].user = vdev;
-					vdev->slot = &slot_info[i];
 					free_slot_num--;
 					spin_unlock(&slot_lock);
 
 					spin_lock(&(vdev->status_lock));
+					vdev->slot = &slot_info[i];
 					vdev->status = DEV_STATUS_OPERATING;
 					spin_unlock(&(vdev->status_lock));
 					pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user ? vdev->user->pid : -1,i,slot_info[i].actual_dev->acc_id);
@@ -342,24 +383,28 @@ static void hw_schedule(void)
 			}
 			else
 			{
+				struct dev_priv *dev;
 				vdev = NULL;
-				// look for other requests
-				for(j=0;j<device_num;j++)
-					if(!list_empty(&(device_data[j].waiters)))
+				// look for other requests that are waiting for a device that is compatible with the current slot
+				for(j=0; j< slot_info[i].compatible_accel_num; j++)
+				{
+					dev = slot_info[i].compatible_accel_num[j];
+					// examine the waiters list of the selected device
+					if(!list_empty(&(dev->waiters)))
 					{
-						vdev = list_entry(device_data[j].waiters.next,struct virtual_dev_t,waiter_list);
-						d = &device_data[j];
+						vdev = list_entry(dev->waiters.next,struct virtual_dev_t,waiter_list);
+						d = dev;
 						break;
 					}
+				}
 
-				// serve selected request
+				// serve the selected request
 				if(vdev)
 				{
-
 					list_del_init(&(vdev->waiter_list));
 
 					// start slot programming
-					if(!program_slot(d->acc_id))
+					if(!program_slot(i,d->acc_id))
 					{
 						// programming succeeded
 						spin_lock(&(vdev->status_lock));
@@ -372,6 +417,7 @@ static void hw_schedule(void)
 						vdev->slot = &slot_info[i];
 						spin_unlock(&slot_lock);
 						spin_unlock(&(vdev->status_lock));
+						pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user?vdev->user->pid:-1,i,d->acc_id);
 					}
 					else
 					{
@@ -380,10 +426,10 @@ static void hw_schedule(void)
 						vdev->status = DEV_STATUS_BLANK;
 						vdev->slot = NULL;
 						spin_unlock(&(vdev->status_lock));
+						pr_err("FPGA programming failed for slot %d with accel %d.\n",i,d->acc_id);
 					}
 
 					// start waiter process
-					pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user?vdev->user->pid:-1,i,d->acc_id);
 					complete(&(vdev->compl));
 				}
 			}
@@ -489,12 +535,6 @@ static int sched_thread_fn(void *data)
 	return 0;
 }
 
-static int build_device_database(void);
-static void free_device_database(void);
-
-
-
-
 // user interface
 
 static ssize_t dev_open(struct inode *inode, struct file *pfile)
@@ -511,6 +551,7 @@ static ssize_t dev_open(struct inode *inode, struct file *pfile)
 	vdev->slot= NULL;
 	vdev->status = DEV_STATUS_BLANK;
 	vdev->dma_buffer_desc = NULL;
+	vdev-> user = NULL;
 	spin_lock_init(&(vdev->status_lock));
 	INIT_LIST_HEAD(&(vdev->waiter_list));
 
@@ -532,6 +573,7 @@ static ssize_t dev_open(struct inode *inode, struct file *pfile)
 #define IOCTL_DMA_START			8
 
 // TODO EXTRA non-blocking require
+
 // arguments:
 //	IOCTL_RELEASE: slot number
 //  IOCTL_REQUIRE: accel_id
@@ -548,8 +590,8 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 	uint16_t address;
 	uint32_t data;
 	
-	command = cmd &0xFFFF;
-	address = (cmd>>16)&0xFFFC; //Masking to 32bit address (lower 2 bits are 0)
+	command = cmd & 0xFFFF;
+	address = (cmd>>16) & 0xFFFC; //Masking to 32bit address (lower 2 bits are 0)
 	data = arg;
 	
 
@@ -574,6 +616,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 				{
 					pr_err("Unauthorized slot access.");
 					ret = -EPERM;
+
 				}
 				unlock_operating_vdev(vdev);
 			}
@@ -679,7 +722,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			break;
 		case IOCTL_DMA_SET_RX_BASE:
 			spin_lock(&(vdev->status_lock));
-				if(vdev->status != DEV_STATUS_CLOSING)
+				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
 				{
 					vdev->dma_buffer_desc.rx_base = arg;
 				}
@@ -687,7 +730,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			break;
 		case IOCTL_DMA_SET_RX_LENGTH:
 			spin_lock(&(vdev->status_lock));
-				if(vdev->status != DEV_STATUS_CLOSING)
+				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
 				{
 					vdev->dma_buffer_desc.rx_length = arg;
 				}
@@ -695,7 +738,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			break;
 		case IOCTL_DMA_SET_TX_BASE:
 			spin_lock(&(vdev->status_lock));
-				if(vdev->status != DEV_STATUS_CLOSING)
+				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
 				{
 					vdev->dma_buffer_desc.tx_base = arg;
 				}
@@ -703,7 +746,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			break;
 		case IOCTL_DMA_SET_TX_LENGTH:
 			spin_lock(&(vdev->status_lock));
-				if(vdev->status != DEV_STATUS_CLOSING)
+				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
 				{
 					vdev->dma_buffer_desc.tx_length = arg;
 				}
@@ -713,19 +756,22 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			if(!lock_operating_vdev(vdev))
 			{
 				vdev->slot->busy = 1;
-				if(!dev_dma_buffer_start_dma(vdev->dma_buffer_desc, vdev->slot))
-					return 0;
-				else return -EINVAL;
+				if(!dev_dma_buffer_start_dma(vdev->dma_buffer_desc, vdev->slot)) ret = 0;
+				else ret = -EINVAL;
+				unlock_operating_vdev(vdev);
 			}
-			
+			else
+			{
+				pr_err("Accelerator is not working.\n");
+				ret = -EPERM;
+			}
+			return ret;
 			break;
 		default:
 			pr_err("Unknown ioctl command code: %u.\n",cmd);
 			return -EPERM;
 			break;
-
 	}
-	return 0;
 }
 
 // give status informations
@@ -783,9 +829,16 @@ static int dev_close (struct inode *inode, struct file *pfile)
 	module_put(THIS_MODULE);
 	return 0;
 }
-/*****************************************************************************************
-								MMAP IMPLEMENTATION
-******************************************************************************************/
+
+/* ======================================================================== 
+					MMAP IMPLEMENTATION
+
+	static void dev_dma_buffer_get(struct dev_dma_buffer_desc *desc);
+	static void dev_dma_buffer_put(struct dev_dma_buffer_desc *desc);
+	static struct dev_dma_buffer_desc* dev_dma_buffer_alloc(uint32_t length);
+	dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc, struct slot_info_t *slot);
+   ========================================================================*/
+
 // ----------------- DMA BUFFER subsystem ---------------- //
 #define MMAP_MAX_BUFFER_LENGTH	4096
 	static void dev_dma_buffer_get(struct dev_dma_buffer_desc *desc)
@@ -829,7 +882,7 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		}
 		
 		// Create descriptor for the dma buffer
-		desc = (struct dev_dma_buffer_desc *)kmalloc(MMAP_MAX_BUFFER_LENGTH,GFP_KERNEL);
+		desc = kmalloc(MMAP_MAX_BUFFER_LENGTH,GFP_KERNEL);
 		if(!desc)
 		{
 			// rewind coherent allocation
@@ -865,8 +918,9 @@ static int dev_close (struct inode *inode, struct file *pfile)
 static int dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc, struct slot_info_t *slot)
 {
 		uint8_t *slot_base = slot->slot_kaddr;
+		uint32_t buf_len = desc->length;
 		// Validate rx and rx parameters
-		if((tx_base+tx_length > 5) || (rx_base+rx_length > 5 || (tx_base & 0x3F !=0) || (rx_base & 0x3F !=0))
+		if((tx_base+tx_length > buf_len) || (rx_base+rx_length > buf_len) || (tx_base & 0x3F !=0) || (rx_base & 0x3F !=0))
 		{
 			dev_err(misc->this_device,"Invalid dma parameters.\n");
 			return -1;
@@ -898,14 +952,14 @@ static void dev_vm_open(struct vm_area_struct * area)
 static void dev_vm_close(struct vm_area_struct * area)
 {
 	struct dev_dma_buffer_desc *desc = (struct dev_dma_buffer_desc *)area->vm_private_data;
-	pr_info(misc->this_device,"Closing VM region for page: 0x%08x.\n",area->vm_pgoff);
+	dev_info(misc->this_device,"Closing VM region for page: 0x%08x.\n",area->vm_pgoff);
 	dev_dma_buffer_put(desc);
 }
 
 struct vm_operations_struct dev_vm_ops = {
 	.open = dev_vm_open,
 	.close = dev_vm_close
-}
+};
 
 static int dev_mmap (struct file *pfile, struct vm_area_struct *vma)
 {
@@ -913,6 +967,7 @@ static int dev_mmap (struct file *pfile, struct vm_area_struct *vma)
 	struct dev_dma_buffer_desc *buf_desc;
 	
 	//Getting current dma buffer
+	// TODO lock the vdev pointer
 	vdev = (struct virtual_dev_t*)pfile->private_data;
 	if(vdev->dma_buffer_desc == NULL)
 	{
@@ -939,9 +994,6 @@ static int dev_mmap (struct file *pfile, struct vm_area_struct *vma)
 	return 0;
 }
 
-/**********************************************************
-			END mmap implementation
-***********************************************************/
 static struct file_operations dev_fops =
 {
 		.owner = THIS_MODULE,
@@ -1481,6 +1533,9 @@ static int connect_to_fpga_mgr(void)
 		pr_err("Cannot get fpga manager.\n");
 		ret = -ENODEV;
 	}
+
+	// program fpga with the static config
+	ret = program_fpga(FPGA_STATIC_CONFIG_NAME);
 err:
 	return ret;
 }
