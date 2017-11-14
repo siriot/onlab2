@@ -35,6 +35,7 @@
 #include <linux/uaccess.h>
 #include <linux/device.h>
 #include <linux/of.h>
+#include <linux/byteorder/generic.h>
 
 #include <linux/fpga/fpga-mgr.h>
 #include <linux/of.h>
@@ -70,6 +71,7 @@ struct dev_priv
 	struct device *dev;
 	struct list_head waiters;
 	struct list_head active_list;
+	char name[32];
 };
 struct virtual_dev_t;
 struct slot_info_t
@@ -88,6 +90,28 @@ struct slot_info_t
 	uint32_t compatible_accel_num;
 	struct dev_priv **compatible_accels;
 };
+
+/* Descriptor for the dma buffer subsystem
+*	ref_cntr - reference counter for the buffer (2 sources: virtual device and the vm areas from the mmapping)
+	dma_addr - physical address of the buffer
+	kaddr - kernel virtual address
+	length - length of the buffer
+	lock - spinlock for the reference counter
+*/
+struct dev_dma_buffer_desc
+{
+	uint32_t ref_cntr;
+	struct spinlock lock;
+	uint32_t dma_addr;
+	uint8_t *kaddr;
+	uint32_t length;
+	
+	uint32_t tx_base;
+	uint32_t tx_length;
+	uint32_t rx_base;
+	uint32_t rx_length;
+};
+
 // Contains information about the device session.
 // This structure is linked to the file descriptor and thus to the session.
 #define DEV_STATUS_BLANK 		0
@@ -144,28 +168,11 @@ struct user_event
 #define AXI_DECOUPLER_BASE_OFFSET		(0x1000U)
 #define AXI_RST_BASE_OFFSET				(0x2000U)
 #define AXI_ACCEL_BASE_OFFSET			(0x3000U)
-
-/* Descriptor for the dma buffer subsystem
-*	ref_cntr - reference counter for the buffer (2 sources: virtual device and the vm areas from the mmapping)
-	dma_addr - physical address of the buffer
-	kaddr - kernel virtual address
-	length - length of the buffer
-	lock - spinlock for the reference counter
-*/
-struct dev_dma_buffer_desc
-{
-	uint32_t ref_cntr;
-	struct spinlock lock;
-	uint32_t dma_addr;
-	uint8_t *kaddr;
-	uint32_t length;
 	
-	uint32_t tx_base;
-	uint32_t tx_length;
-	uint32_t rx_base;
-	uint32_t rx_length;
-}
-	
+/* Bitfile nameing conventions:
+ * 	static: static.bit
+ * 	accels: <accel_name from dev tree>_slotx.bit; x= slot idex (0-)
+ */
 #define FPGA_STATIC_CONFIG_NAME "static.bit"
 
 /**
@@ -223,7 +230,7 @@ struct dev_dma_buffer_desc
 	// database builder functions
 	static int gather_slot_data(void);
 	static void free_slot_data(void);
-	static void print_slot_data(void)
+	static void print_slot_data(void);
 	static int gather_accel_data(void);
 	static void free_accel_data(void);
 
@@ -310,6 +317,7 @@ static int program_slot(int slot_num, int acc_id)
 {
 	uint32_t tmp;
 	int ret;
+	char config_file_name[100];
 
 	if(slot_num < 0 || slot_num >= SLOT_NUM) return -1;
 	// stop the previous accelerator
@@ -323,11 +331,11 @@ static int program_slot(int slot_num, int acc_id)
 	iowrite32(tmp,slot_info[slot_num].slot_kaddr + AXI_DMA_TX_OFFSET + AXI_DMA_CONTROL_OFFSET);
 
 
-	static char name[100];
-	snprintf(name,100,"%s.bit",device_data[acc_id].dev->of_node->name);
+	
+	snprintf(config_file_name,100,"%s_slot%d.bit",device_data[acc_id].name,slot_num);
 	// start programming
-	pr_info("Loading configuration: %s - id :%d.\n",name,acc_id);
-	ret = fpga_mgr_firmware_load(mgr, FPGA_MGR_PARTIAL_RECONFIG, name);
+	pr_info("Loading configuration: %s - id :%d.\n",config_file_name,acc_id);
+	ret = fpga_mgr_firmware_load(mgr, FPGA_MGR_PARTIAL_RECONFIG, config_file_name);
 	pr_info("FPGA configuration finished.\n");
 	if(ret)
 	{
@@ -388,7 +396,7 @@ static void hw_schedule(void)
 				// look for other requests that are waiting for a device that is compatible with the current slot
 				for(j=0; j< slot_info[i].compatible_accel_num; j++)
 				{
-					dev = slot_info[i].compatible_accel_num[j];
+					dev = slot_info[i].compatible_accels[j];
 					// examine the waiters list of the selected device
 					if(!list_empty(&(dev->waiters)))
 					{
@@ -699,7 +707,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 					hw_addr = vdev->slot->slot_kaddr + AXI_ACCEL_BASE_OFFSET + address;
 					data = ioread32(hw_addr);
 				}
-				spin_unlock(slot_lock);
+				spin_unlock(&slot_lock);
 			}
 			spin_unlock(&(vdev->status_lock));
 			return data;
@@ -724,7 +732,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			spin_lock(&(vdev->status_lock));
 				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
 				{
-					vdev->dma_buffer_desc.rx_base = arg;
+					vdev->dma_buffer_desc->rx_base = arg;
 				}
 			spin_unlock(&(vdev->status_lock));
 			break;
@@ -732,7 +740,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			spin_lock(&(vdev->status_lock));
 				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
 				{
-					vdev->dma_buffer_desc.rx_length = arg;
+					vdev->dma_buffer_desc->rx_length = arg;
 				}
 			spin_unlock(&(vdev->status_lock));
 			break;
@@ -740,7 +748,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			spin_lock(&(vdev->status_lock));
 				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
 				{
-					vdev->dma_buffer_desc.tx_base = arg;
+					vdev->dma_buffer_desc->tx_base = arg;
 				}
 			spin_unlock(&(vdev->status_lock));
 			break;
@@ -748,7 +756,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			spin_lock(&(vdev->status_lock));
 				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
 				{
-					vdev->dma_buffer_desc.tx_length = arg;
+					vdev->dma_buffer_desc->tx_length = arg;
 				}
 			spin_unlock(&(vdev->status_lock));
 			break;
@@ -772,6 +780,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			return -EPERM;
 			break;
 	}
+	return 0;
 }
 
 // give status informations
@@ -857,8 +866,8 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		if(cntr==0)
 		{
 			// Free the buffer and the descriptor
-			dev_info(misc->this_device,"Freeing coherent dma buffer.\n");
-			dma_free_coherent(misc->this_device, desc->length, desc->kaddr, desc->dma_addr);
+			dev_info(misc.this_device,"Freeing coherent dma buffer.\n");
+			dma_free_coherent(misc.this_device, desc->length, desc->kaddr, desc->dma_addr);
 			kfree(desc);		
 		}
 	}
@@ -869,12 +878,12 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		uint32_t dma_addr;
 		uint8_t *kbuf;
 		
-		dev_info(misc->this_device, "Allocating coherent DMA buffer.\n");
+		dev_info(misc.this_device, "Allocating coherent DMA buffer.\n");
 		
 		// TODO use the given length		
 		length = MMAP_MAX_BUFFER_LENGTH;
 		// Allocate coherent dma buffer
-		kbuf = dma_alloc_coherent(misc->this_device, length, &dma_addr, GFP_KERNEL);
+		kbuf = dma_alloc_coherent(misc.this_device, length, &dma_addr, GFP_KERNEL);
 		if(!kbuf)
 		{
 			pr_err("Cannot allocate coherent dma buffer.\n");
@@ -886,7 +895,7 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		if(!desc)
 		{
 			// rewind coherent allocation
-			dma_free_coherent(misc->this_device, length, kbuf, dma_addr);
+			dma_free_coherent(misc.this_device, length, kbuf, dma_addr);
 			return NULL;
 		}
 		desc-> ref_cntr = 1;
@@ -901,28 +910,15 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		return desc;
 	}
 	
-	struct dev_dma_buffer_desc
-	{
-		uint32_t ref_cntr;
-		struct spinlock lock;
-		uint32_t dma_addr;
-		uint8_t *kaddr;
-		uint32_t length;
-		
-		uint32_t tx_base;
-		uint32_t tx_length;
-		uint32_t rx_base;
-		uint32_t rx_length;
-	};
 
 static int dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc, struct slot_info_t *slot)
 {
 		uint8_t *slot_base = slot->slot_kaddr;
 		uint32_t buf_len = desc->length;
 		// Validate rx and rx parameters
-		if((tx_base+tx_length > buf_len) || (rx_base+rx_length > buf_len) || (tx_base & 0x3F !=0) || (rx_base & 0x3F !=0))
+		if((desc->tx_base+desc->tx_length > buf_len) || (desc->rx_base+desc->rx_length > buf_len) || ((desc->tx_base & 0x3F) !=0) || ((desc->rx_base & 0x3F) !=0))
 		{
-			dev_err(misc->this_device,"Invalid dma parameters.\n");
+			dev_err(misc.this_device,"Invalid dma parameters.\n");
 			return -1;
 		}
 		//program the tx channel
@@ -944,7 +940,7 @@ static void dev_vm_open(struct vm_area_struct * area)
 {
 	struct dev_dma_buffer_desc *desc = (struct dev_dma_buffer_desc *)area->vm_private_data;
 	
-	dev_info(misc->this_device,"Openinng VM region for page: 0x%08x.\n", area->vm_pgoff);
+	dev_info(misc.this_device,"Openinng VM region for page: 0x%08lx.\n", area->vm_pgoff);
 	// Incrementing rerference counter
 	dev_dma_buffer_get(desc);
 	
@@ -952,7 +948,7 @@ static void dev_vm_open(struct vm_area_struct * area)
 static void dev_vm_close(struct vm_area_struct * area)
 {
 	struct dev_dma_buffer_desc *desc = (struct dev_dma_buffer_desc *)area->vm_private_data;
-	dev_info(misc->this_device,"Closing VM region for page: 0x%08x.\n",area->vm_pgoff);
+	dev_info(misc.this_device,"Closing VM region for page: 0x%08lx.\n",area->vm_pgoff);
 	dev_dma_buffer_put(desc);
 }
 
@@ -981,7 +977,7 @@ static int dev_mmap (struct file *pfile, struct vm_area_struct *vma)
 	}
 	
 	// Remap the buffer to the user space virtual memory
-	dev_info(misc->this_device,"Remapping dma coherent buffer.\n");
+	dev_info(misc.this_device,"Remapping dma coherent buffer.\n");
 	if(remap_pfn_range(vma, vma->vm_start, buf_desc->dma_addr >> PAGE_SHIFT, buf_desc->length, vma->vm_page_prot))
 	{
 		return -EAGAIN;
@@ -1014,10 +1010,8 @@ static struct file_operations dev_fops =
 */
 static int fpga_sched_init(void)
 {
-	int ret;
-	int i;
 	pr_info("Starting fpga scheduler module.\n");
-
+	pr_info("Building device modell.\n");
 	if(build_device_modell())
 	{
 		pr_err("Cannot build device modell.\n");
@@ -1025,18 +1019,21 @@ static int fpga_sched_init(void)
 	}
 
 	// build database
+	pr_info("Gathering slot data.\n");
 	if(gather_slot_data())
 	{
 		pr_err("Failed to init slot data.\n");
 		goto err1;
 	}
 
+	pr_info("Gathering accel data.\n");
 	if(gather_accel_data())
 	{
 		pr_err("Failed to load accel data.\n");
 		goto err2;
 	}
 
+	pr_info("Connecting to the fpga manager.\n");
 	if(connect_to_fpga_mgr())
 	{
 		pr_err("Cannot init fpga manager.\n");
@@ -1089,7 +1086,7 @@ static void fpga_sched_exit(void)
 	wait_for_completion(&thread_stop);
 
 	procfs_destroy();
-	misc_deregister();
+	misc_deregister(&misc);
 	disconnect_from_fpga_mgr();
 	free_accel_data();
 	free_slot_data();
@@ -1105,6 +1102,7 @@ static void fpga_sched_exit(void)
 	static void clean_device_modell(void);
    ========================================================================*/
 
+static struct bus_type fpga_virtual_bus_type;
 
 static int fpga_virtual_bus_match(struct device *dev, struct device_driver *drv)
 {
@@ -1210,6 +1208,7 @@ static int gather_slot_data(void)
 	int slot_no;
 	void *slot_kaddr;
 	int ok;
+	int ret;
 
 	// initialize slot database
 	SLOT_NUM = 0;
@@ -1235,7 +1234,7 @@ static int gather_slot_data(void)
 		ret = -ENODEV;
 		goto err1;
 	}
-	pr_info("%d slots found.\n",SLOT_NUM);
+	pr_info("%d slots found.\n",slot_no);
 
 	// allocate memory for the slot info structures
 	slot_info = (struct slot_info_t*)kmalloc(sizeof(struct slot_info_t) * slot_no, GFP_KERNEL);
@@ -1253,12 +1252,12 @@ static int gather_slot_data(void)
 	{
 		ok = 0;
 		// allocate static region addresses for the slot
-		if(of_address_to_resource(slot,0,&res))
+		if(!of_address_to_resource(slot,0,&res))
 		{
 
 			if(request_mem_region(res.start, resource_size(&res), "FPGA ACCELERATOR SLOT") != NULL)
 			{
-				slot_kaddr = of_iomap(slot,0);
+				slot_kaddr = ioremap(res.start,resource_size(&res));
 				if(slot_kaddr)
 				{
 					// address mapping succeded
@@ -1268,8 +1267,15 @@ static int gather_slot_data(void)
 					ok = 1;
 				}
 				else
+				{
 					release_mem_region(res.start, resource_size(&res));
-			}	
+					pr_err("Cannot remap slot %d base address.\n",i);
+				}
+			}
+			else
+			{
+				pr_err("Cannot request slot %d base address.\n",i);
+			}
 		}
 			// check for success
 			if(!ok)
@@ -1312,7 +1318,7 @@ static void free_slot_data(void)
 	{
 		if(slot_info[i].slot_kaddr)
 		{
-			iounmap(slot_info[i].kaddr);
+			iounmap(slot_info[i].slot_kaddr);
 			release_mem_region(slot_info[i].base_address, slot_info[i].address_length);
 		}
 		if(slot_info[i].compatible_accels != NULL)
@@ -1330,8 +1336,8 @@ static void print_slot_data(void)
 		printk("Slot no: %d,\tslot base address: 0x%08x,\tslot address length: 0x%x,associated accel num: %d.\n",i,slot_info[i].base_address, slot_info[i].address_length, slot_info[i].compatible_accel_num);
 		for(j=0;j<slot_info[i].compatible_accel_num;j++)
 			printk("Slot no --%d-- is compatible with accel --%d--.\n",i,slot_info[i].compatible_accels[j]->acc_id);
-		printk("There are %d slots and %d accelerators in the system.\n",SLOT_NUM,device_num);
 	}
+	printk("There are %d slots and %d accelerators in the system.\n",SLOT_NUM,device_num);
 }
 
 /* ======================================================================== 
@@ -1348,16 +1354,15 @@ static int gather_accel_data(void)
 	int i,j;
 	int ret;
 	uint32_t accel_num;
-	uint8_t *text_prop;
-	uint32_t *word_prop;
+	const uint8_t *text_prop;
+	const uint32_t *word_prop;
 	int prop_len;
-	uint8_t name_buf[64] = {0};
 
 	
 	// init the global variables
 	device_num = 0;
 	device_data = NULL;
-	devices = NULL
+	devices = NULL;
 
 	base = of_find_node_by_name(NULL,"fpga_virtual_accels");
 	if(!base)
@@ -1379,14 +1384,14 @@ static int gather_accel_data(void)
 
 
 	// allocate structures for all the dev_privs
-	device_data = (struct dev_priv*)kmalloc(device_num*sizeof(struct dev_priv),GFP_KERNEL);
+	device_data = (struct dev_priv*)kmalloc(accel_num*sizeof(struct dev_priv),GFP_KERNEL);
 	if(!device_data)
 	{
 		ret = -ENOMEM;
 		goto err1;
 	}
 	// allocate device_data
-	devices = (struct device*)kzalloc(device_num*sizeof(struct device),GFP_KERNEL);
+	devices = (struct device*)kzalloc(accel_num*sizeof(struct device),GFP_KERNEL);
 	if(!devices)
 	{
 		ret = -ENOMEM;
@@ -1396,7 +1401,7 @@ static int gather_accel_data(void)
 	// build compatible accel database for the slots
 	for(i=0;i<SLOT_NUM;i++)
 	{
-		slot_info[i].compatible_accels = (struct dev_priv**)kmalloc(accel_num* sizeof(struct dev_priv*));
+		slot_info[i].compatible_accels = (struct dev_priv**)kmalloc(accel_num* sizeof(struct dev_priv*),GFP_KERNEL);
 		if(slot_info[i].compatible_accels == NULL)
 		{
 			pr_err("Cannot allocate memory for compatible accel list.\n");
@@ -1408,17 +1413,20 @@ static int gather_accel_data(void)
 	i=0;
 	for_each_child_of_node(base,acc)
 	{
-		// get accel name property
+		// get accel name propertyl
 		text_prop = of_get_property(acc,"fpga_virtual_config_name",&prop_len);
 		if(text_prop==NULL || prop_len==0)
 		{
 			pr_err("Cannot get accelerator name.\n");
 			dev_set_name(&devices[i],"%s",acc->name);
+			sprintf(device_data[i].name,"acc_%d",i);
 		}
 		else
 		{
-			strncpy(name_buf, text_prop, 63);
-			dev_set_name(&devices[i],"%s",name_buf);
+			//pr_info("Name found for accel %d, name: %s Length: %d, address: %p, dev name ptr: %p",i,text_prop,prop_len,text_prop,device_data[i].name);
+			strncpy(device_data[i].name,text_prop,32>prop_len? prop_len:32);
+			dev_set_name(&devices[i],"%s",device_data[i].name);
+			//pr_info("RDY");
 		}
 
 		// get compatible slot list
@@ -1429,11 +1437,12 @@ static int gather_accel_data(void)
 		}
 		else
 		{
+			prop_len/=4;
 			// iterate over the compatible slots
 			pr_info("Compatible slot count: %d.\n",prop_len);
 			for(j=0;j<prop_len;j++)
 			{
-				uint32_t slot_index = word_prop[j];
+				uint32_t slot_index =be32_to_cpu(word_prop[j]);
 				pr_info("Accel %d is compatible with slot %d.\n",i,slot_index);
 
 				if(slot_index < SLOT_NUM)
@@ -1531,18 +1540,22 @@ static int connect_to_fpga_mgr(void)
 	if(IS_ERR(mgr))
 	{
 		pr_err("Cannot get fpga manager.\n");
+		mgr=NULL;
 		ret = -ENODEV;
 	}
 
 	// program fpga with the static config
+	pr_info("Loading static FPGA configuration.\n");
 	ret = program_fpga(FPGA_STATIC_CONFIG_NAME);
+	//ret=0;
 err:
 	return ret;
 }
 
 static void disconnect_from_fpga_mgr(void)
 {
-	fpga_mgr_put(mgr);
+	if(mgr)
+		fpga_mgr_put(mgr);
 }
 
 
@@ -1583,6 +1596,7 @@ ssize_t procfile_read(struct file *file, char __user *buffer, size_t bufsize, lo
 	}
 	spin_unlock(&slot_lock);
 
+	print_slot_data();
 
 	if(*offset>=len) return 0;
 
