@@ -497,12 +497,12 @@ static int sched_thread_fn(void *data)
 						switch(status)
 						{
 						case DEV_STATUS_BLANK:
-							dev_dma_buffer_put(vdev->dma_buffer_desc);
+							if(vdev->dma_buffer_desc != NULL) dev_dma_buffer_put(vdev->dma_buffer_desc);
 							kfree(vdev);
 							break;
 						case DEV_STATUS_QUEUED:
 							list_del(&(vdev->waiter_list));
-							dev_dma_buffer_put(vdev->dma_buffer_desc);
+							if(vdev->dma_buffer_desc != NULL) dev_dma_buffer_put(vdev->dma_buffer_desc);
 							kfree(vdev);
 							break;
 						case DEV_STATUS_OPERATING:
@@ -515,7 +515,7 @@ static int sched_thread_fn(void *data)
 							free_slot_num++;
 							vdev->slot = NULL;
 							spin_unlock(&slot_lock);
-							dev_dma_buffer_put(vdev->dma_buffer_desc);
+							if(vdev->dma_buffer_desc != NULL)  dev_dma_buffer_put(vdev->dma_buffer_desc);
 							kfree(vdev);
 							break;
 						default:
@@ -710,6 +710,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 				spin_unlock(&slot_lock);
 			}
 			spin_unlock(&(vdev->status_lock));
+			pr_info("ACCEL READ with address: %lu, data: %lu",address,data);
 			return data;
 			break;
 		case IOCTL_AXI_WRITE:
@@ -859,6 +860,9 @@ static int dev_close (struct inode *inode, struct file *pfile)
 	static void dev_dma_buffer_put(struct dev_dma_buffer_desc *desc)
 	{
 		uint32_t cntr;
+
+		if(desc==NULL) return;
+
 		spin_lock(&(desc->lock));
 		desc->ref_cntr--;
 		cntr = desc->ref_cntr;
