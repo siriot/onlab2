@@ -54,6 +54,9 @@
 #include <linux/ioport.h>
 
 
+
+#define DRIVER_NAME "FPGA_scheduler"
+
 /* Resource locking policy:
 	// dev_close
  * virt_dev -> event queue -> slot
@@ -210,6 +213,7 @@ struct user_event
 	struct dev_priv *device_data; // pointer to the dev_priv array
 
 // device modell data
+	struct platform_device * static_region_dev; // this comes from the device tree
 	static struct device fpga_virtual_bus;
 	static struct device *devices;
 
@@ -239,7 +243,7 @@ struct user_event
 	static void disconnect_from_fpga_mgr(void);
 
 	// linux device modell functions
-	static int build_device_modell(void);
+	static int build_device_modell(struct platform_device *pdev);
 	static void clean_device_modell(void);
 
 	// procfs interface
@@ -572,7 +576,7 @@ static ssize_t dev_open(struct inode *inode, struct file *pfile)
 // ioctl command codes
 #define IOCTL_RELEASE 			0
 #define IOCTL_REQUIRE 			1
-#define IOCTL_AXI_READ			2
+#define IOCTL_AXI_READ			20
 #define IOCTL_AXI_WRITE			3
 #define IOCTL_DMA_SET_TX_BASE	4
 #define IOCTL_DMA_SET_TX_LENGTH	5
@@ -696,6 +700,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 		}
 			break;
 		case IOCTL_AXI_READ:
+			pr_info("ACCEL READ with address: %lu, data: %lu",address,data);
 			spin_lock(&(vdev->status_lock));
 			if(vdev->status == DEV_STATUS_OPERATING)
 			{
@@ -710,10 +715,10 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 				spin_unlock(&slot_lock);
 			}
 			spin_unlock(&(vdev->status_lock));
-			pr_info("ACCEL READ with address: %lu, data: %lu",address,data);
 			return data;
 			break;
 		case IOCTL_AXI_WRITE:
+		pr_info("ACCEL WRITE with address: %lu, data: %lu",address,data);
 			spin_lock(&(vdev->status_lock));
 			if(vdev->status == DEV_STATUS_OPERATING)
 			{
@@ -871,7 +876,7 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		{
 			// Free the buffer and the descriptor
 			dev_info(misc.this_device,"Freeing coherent dma buffer.\n");
-			dma_free_coherent(misc.this_device, desc->length, desc->kaddr, desc->dma_addr);
+			dma_free_coherent(NULL, desc->length, desc->kaddr, desc->dma_addr);
 			kfree(desc);		
 		}
 	}
@@ -887,7 +892,7 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		// TODO use the given length		
 		length = MMAP_MAX_BUFFER_LENGTH;
 		// Allocate coherent dma buffer
-		kbuf = dma_alloc_coherent(misc.this_device, length, &dma_addr, GFP_KERNEL);
+		kbuf = dma_alloc_coherent(NULL, length, &dma_addr, GFP_KERNEL);
 		if(!kbuf)
 		{
 			pr_err("Cannot allocate coherent dma buffer.\n");
@@ -899,7 +904,7 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		if(!desc)
 		{
 			// rewind coherent allocation
-			dma_free_coherent(misc.this_device, length, kbuf, dma_addr);
+			dma_free_coherent(NULL, length, kbuf, dma_addr);
 			return NULL;
 		}
 		desc-> ref_cntr = 1;
@@ -1005,100 +1010,6 @@ static struct file_operations dev_fops =
 };
 
 
-
-/* 	************************************************************************
-	************************************************************************
-	****					MODULE INIT / EXIT							****
-	************************************************************************
-	************************************************************************
-*/
-static int fpga_sched_init(void)
-{
-	pr_info("Starting fpga scheduler module.\n");
-	pr_info("Building device modell.\n");
-	if(build_device_modell())
-	{
-		pr_err("Cannot build device modell.\n");
-		goto err;
-	}
-
-	// build database
-	pr_info("Gathering slot data.\n");
-	if(gather_slot_data())
-	{
-		pr_err("Failed to init slot data.\n");
-		goto err1;
-	}
-
-	pr_info("Gathering accel data.\n");
-	if(gather_accel_data())
-	{
-		pr_err("Failed to load accel data.\n");
-		goto err2;
-	}
-
-	pr_info("Connecting to the fpga manager.\n");
-	if(connect_to_fpga_mgr())
-	{
-		pr_err("Cannot init fpga manager.\n");
-		goto err3;
-	}
-
-
-	// register misc device in the system
-	misc.fops = &dev_fops;
-	misc.minor = MISC_DYNAMIC_MINOR;
-	misc.name = "fpga_mgr";
-	if(misc_register(&misc))
-	{
-		pr_warn("Couldn't initialize miscdevice /dev/fpga_mgr.\n");
-		goto err4;
-	}
-	pr_info("Misc device initialized: /dev/fpga_mgr.\n");
-
-	// create event handler kernel thread
-	sched_thread = kthread_run(sched_thread_fn,NULL,"fpga_sched");
-	if(IS_ERR(sched_thread))
-	{
-		pr_err("Scheduler thread failed to start.\n");
-		goto err5;
-	}
-
-
-	procfs_init();
-
-	return 0;
-	err5:
-		misc_deregister(&misc);
-	err4:
-		disconnect_from_fpga_mgr();
-	err3:
-		free_accel_data();
-	err2:
-		free_slot_data();
-	err1:
-		clean_device_modell();
-	err:
-	return -1;
-}
-
-static void fpga_sched_exit(void)
-{
-	//send stop signal to the kernel thread
-	quit = 1;
-	complete(&event_in);
-	wait_for_completion(&thread_stop);
-
-	procfs_destroy();
-	misc_deregister(&misc);
-	disconnect_from_fpga_mgr();
-	free_accel_data();
-	free_slot_data();
-	clean_device_modell();
-	pr_info("Fpga scheduler module exited.\n");
-}
-
-
 /* ======================================================================== 
 					LINUX DEVICE MODELL HANDLER
 
@@ -1143,9 +1054,12 @@ static ssize_t id_show (struct device *dev, struct device_attribute *attr, char 
 }
 DEVICE_ATTR(id,0444,id_show,NULL);
 
-static int build_device_modell(void)
+static int build_device_modell(struct platform_device *pdev)
 {
 	int ret = 0;
+
+	// saving the platform device pointer
+	static_region_dev = pdev;
 
 	// registering fpga virtual bus
 	if(bus_register(&fpga_virtual_bus_type))
@@ -1617,6 +1531,119 @@ static struct file_operations proc_fops =
 };
 
 
+
+/* 	************************************************************************
+	************************************************************************
+	****			    PLATFORM DRIVER PROBE / REMOVE				    ****
+	************************************************************************
+	************************************************************************
+*/
+static int fpga_sched_init(void)
+{
+	pr_info("Starting fpga scheduler module.\n");
+	pr_info("Building device modell.\n");
+	if(build_device_modell(NULL))
+	{
+		pr_err("Cannot build device modell.\n");
+		goto err;
+	}
+
+	// build database
+	pr_info("Gathering slot data.\n");
+	if(gather_slot_data())
+	{
+		pr_err("Failed to init slot data.\n");
+		goto err1;
+	}
+
+	pr_info("Gathering accel data.\n");
+	if(gather_accel_data())
+	{
+		pr_err("Failed to load accel data.\n");
+		goto err2;
+	}
+
+	pr_info("Connecting to the fpga manager.\n");
+	if(connect_to_fpga_mgr())
+	{
+		pr_err("Cannot init fpga manager.\n");
+		goto err3;
+	}
+
+
+	// register misc device in the system
+	misc.fops = &dev_fops;
+	misc.minor = MISC_DYNAMIC_MINOR;
+	misc.name = "fpga_mgr";
+	if(misc_register(&misc))
+	{
+		pr_warn("Couldn't initialize miscdevice /dev/fpga_mgr.\n");
+		goto err4;
+	}
+	pr_info("Misc device initialized: /dev/fpga_mgr.\n");
+
+	// create event handler kernel thread
+	sched_thread = kthread_run(sched_thread_fn,NULL,"fpga_sched");
+	if(IS_ERR(sched_thread))
+	{
+		pr_err("Scheduler thread failed to start.\n");
+		goto err5;
+	}
+
+
+	procfs_init();
+
+	return 0;
+	err5:
+		misc_deregister(&misc);
+	err4:
+		disconnect_from_fpga_mgr();
+	err3:
+		free_accel_data();
+	err2:
+		free_slot_data();
+	err1:
+		clean_device_modell();
+	err:
+	return -1;
+}
+
+static void fpga_sched_exit(void)
+{
+	//send stop signal to the kernel thread
+	quit = 1;
+	complete(&event_in);
+	wait_for_completion(&thread_stop);
+
+	procfs_destroy();
+	misc_deregister(&misc);
+	disconnect_from_fpga_mgr();
+	free_accel_data();
+	free_slot_data();
+	clean_device_modell();
+	pr_info("Fpga scheduler module exited.\n");
+}				
+
+
+/*
+static struct of_device_id fpga_sched_of_match[] = {
+	{ .compatible = "fpga_virtual_scheduler", },
+	{ }
+};
+
+
+static struct platform_driver fpga_sched_platform_driver = {
+	.probe = fpga_sched_probe,
+	.remove = fpga_sched_remove,
+	.driver = {
+		.owner = THIS_MODULE,
+		.name = DRIVER_NAME,
+		.of_match_table = fpga_sched_of_match,
+	},
+};
+
+module_platform_driver(fpga_sched_platform_driver);
+*/
 
 module_init(fpga_sched_init);
 module_exit(fpga_sched_exit);
