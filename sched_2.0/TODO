@@ -1,0 +1,3 @@
+- devtree rebuild with compatible flag
+- bug check for new dma code
+- dma test, check mmap

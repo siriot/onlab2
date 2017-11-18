@@ -42,6 +42,10 @@ int main(int argc, char **argv)
 	rx_buf = tx_buf + 64;
 	msync(rx_buf,64,MS_SYNC);
 
+	printf("Sent data:\n");
+	for(i=0;i<64;i++)
+		printf("%02x",tx_buf[i]);
+
 	printf("Received data:\n");
 	for(i=0;i<64;i++)
 		printf("%02x",rx_buf[i]);
