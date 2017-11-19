@@ -117,6 +117,18 @@ struct slot_info_t
 	struct dev_priv **compatible_accels;
 };
 
+/* 	Buffer descpriptor format.
+ *	User space program describes the dma request in this form, and then executes
+ *	a dma start ioctl with a pointer to such a structure.
+ */
+struct user_dma_buffer_desc
+{
+	u32 tx_offset;
+	u32 rx_offset;
+	u32 tx_length;
+	u32 rx_length;
+};
+
 /* Descriptor for the dma buffer subsystem
 *	ref_cntr - reference counter for the buffer (2 sources: virtual device and the vm areas from the mmapping)
 	dma_addr - physical address of the buffer
@@ -132,10 +144,7 @@ struct dev_dma_buffer_desc
 	uint8_t *kaddr;
 	uint32_t length;
 	// requeset properties
-	uint32_t tx_offset;
-	uint32_t rx_offset;
-	uint32_t tx_length;
-	uint32_t rx_length;
+	struct user_dma_buffer_desc user_request;
 	// physical address of the buffers
 	dma_addr_t tx_base;
 	dma_addr_t rx_base;
@@ -286,8 +295,6 @@ struct user_event
 	static int lock_operating_vdev(struct virtual_dev_t *vdev);
 	static void unlock_operating_vdev(struct virtual_dev_t *vdev);
 	
-	static int dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc,struct slot_info_t *slot);
-	
 	
 	// database builder functions
 	static int gather_slot_data(void);
@@ -315,7 +322,6 @@ struct user_event
 	static void dev_dma_buffer_get(struct dev_dma_buffer_desc *desc);
 	static void dev_dma_buffer_put(struct dev_dma_buffer_desc *desc);
 	static struct dev_dma_buffer_desc* dev_dma_buffer_alloc(uint32_t length);
-	dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc, struct slot_info_t *slot);
    ========================================================================*/
 
 
@@ -817,10 +823,6 @@ static ssize_t dev_open(struct inode *inode, struct file *pfile)
 #define IOCTL_REQUIRE 			1
 #define IOCTL_AXI_READ			20
 #define IOCTL_AXI_WRITE			3
-#define IOCTL_DMA_SET_TX_BASE	4
-#define IOCTL_DMA_SET_TX_LENGTH	5
-#define IOCTL_DMA_SET_RX_BASE	6
-#define IOCTL_DMA_SET_RX_LENGTH	7
 #define IOCTL_DMA_START			8
 #define IOCTL_DMA_WAIT_FOR_RDY	9
 
@@ -955,7 +957,12 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 				spin_unlock(&slot_lock);
 			}
 			spin_unlock(&(vdev->status_lock));
-			return data;
+			if(copy_to_user((void*)arg,&data,sizeof(data)))
+			{
+				dev_err(&(sdev->dev),"Cannot copy data to user space.\n");
+				return -ENOMEM;
+			}
+			return 0;
 			break;
 		case IOCTL_AXI_WRITE:
 		pr_info("ACCEL WRITE with address: %d, data: %u",address,data);
@@ -969,56 +976,58 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 					// Physical address = slot base + accel base offset + offset
 					hw_addr = vdev->slot->slot_kaddr + AXI_ACCEL_BASE_OFFSET + address;
 					iowrite32(data,hw_addr);	
+					ret = 0;
 				}
+				else ret = -ENODEV;
 				spin_unlock(&slot_lock);
 			}
+			else ret = -ENODEV;
 			spin_unlock(&(vdev->status_lock));
-			break;
-		case IOCTL_DMA_SET_RX_BASE:
-			spin_lock(&(vdev->status_lock));
-				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
-				{
-					vdev->dma_buffer_desc->rx_offset = arg;
-				}
-			spin_unlock(&(vdev->status_lock));
-			break;
-		case IOCTL_DMA_SET_RX_LENGTH:
-			spin_lock(&(vdev->status_lock));
-				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
-				{
-					vdev->dma_buffer_desc->rx_length = arg;
-				}
-			spin_unlock(&(vdev->status_lock));
-			break;
-		case IOCTL_DMA_SET_TX_BASE:
-			spin_lock(&(vdev->status_lock));
-				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
-				{
-					vdev->dma_buffer_desc->tx_offset = arg;
-				}
-			spin_unlock(&(vdev->status_lock));
-			break;
-		case IOCTL_DMA_SET_TX_LENGTH:
-			spin_lock(&(vdev->status_lock));
-				if(vdev->status != DEV_STATUS_CLOSING && vdev->dma_buffer_desc!=NULL)
-				{
-					vdev->dma_buffer_desc->tx_length = arg;
-				}
-			spin_unlock(&(vdev->status_lock));
+			return ret;
 			break;
 		case IOCTL_DMA_START:
+		{
+			struct dev_dma_buffer_desc *desc = vdev->dma_buffer_desc;
+			struct user_dma_buffer_desc *rqst = &(desc->user_request);
+			if(copy_from_user(rqst, (void*)arg, sizeof(struct user_dma_buffer_desc)))
+			{
+				dev_err(&(sdev->dev),"Cannot copy user dma request from user space.\n");
+				return -ENOMEM;
+			}
+
+			// Validate rx and rx parameters
+			if((rqst->tx_offset+rqst->tx_length > desc->length) || 
+				(rqst->rx_offset+rqst->rx_length > desc->length) || 
+				(rqst->tx_offset == rqst->rx_offset) ||
+				((rqst->tx_offset<rqst->rx_offset) && (rqst->tx_offset+rqst->tx_length>rqst->rx_offset))|| 
+				((rqst->rx_offset<rqst->tx_offset) && (rqst->rx_offset+rqst->rx_length>rqst->tx_offset))||
+				((rqst->tx_offset & 0x3F) !=0) || 
+				((rqst->rx_offset & 0x3F) !=0))
+			{
+				dev_err(&(sdev->dev),"Invalid dma request.\n");
+				return -EINVAL;
+			}
+
+			if(dev_dma_buffer_map(desc))
+				return -EINVAL;
+
 			if(!lock_operating_vdev(vdev))
 			{
-				if(!dev_dma_buffer_start_dma(vdev->dma_buffer_desc, vdev->slot)) ret = 0;
-				else ret = -EINVAL;
+				ret = dma_start_tx_rx(vdev->slot,
+					desc->tx_base,	// tx base
+					desc->rx_base, // rx_base
+					desc->user_request.tx_length,				// tx length
+					desc->user_request.rx_length					// rx length
+							);	
 				unlock_operating_vdev(vdev);
 			}
 			else
 			{
 				pr_err("Accelerator is not working.\n");
-				ret = -EPERM;
+				ret = -ENODEV;
 			}
 			return ret;
+		}
 			break;
 		case IOCTL_DMA_WAIT_FOR_RDY:
 			if(!lock_operating_vdev(vdev))
@@ -1030,12 +1039,13 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 			else
 			{
 				pr_err("Accelerator is not working.\n");
-				ret = -EPERM;
+				ret = -ENODEV;
 			}
+			return 0;
 			break;
 		default:
 			pr_err("Unknown ioctl command code: %u.\n",cmd);
-			return -EPERM;
+			return -EINVAL;
 			break;
 	}
 	return 0;
@@ -1103,7 +1113,6 @@ static int dev_close (struct inode *inode, struct file *pfile)
 	static void dev_dma_buffer_get(struct dev_dma_buffer_desc *desc);
 	static void dev_dma_buffer_put(struct dev_dma_buffer_desc *desc);
 	static struct dev_dma_buffer_desc* dev_dma_buffer_alloc(uint32_t length);
-	dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc, struct slot_info_t *slot);
    ========================================================================*/
 
 // ----------------- DMA BUFFER subsystem ---------------- //
@@ -1163,10 +1172,11 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		desc->length = length;
 		desc-> tx_base = 0;
 		desc->rx_base = 0;
-		desc-> tx_offset = 0;
-		desc->rx_offset = 0;
-		desc-> tx_length = 0;
-		desc->rx_length = 0;
+		desc->user_request.tx_offset = 0;
+		desc->user_request.rx_offset = 0;
+		desc->user_request.tx_length = 0;
+		desc->user_request.rx_length = 0;
+		desc->user_request.rx_length = 0;
 		spin_lock_init(&(desc->lock));
 		return desc;
 	}
@@ -1175,11 +1185,11 @@ static void dev_dma_buffer_unmap(struct dev_dma_buffer_desc *desc)
 {
 	dma_unmap_single(&(sdev->dev), 
 							desc->tx_base,
-							desc->tx_length,
+							desc->user_request.tx_length,
 							DMA_TO_DEVICE);
 	dma_unmap_single(&(sdev->dev), 
 							desc->rx_base,
-							desc->rx_length,
+							desc->user_request.rx_length,
 							DMA_FROM_DEVICE);
 }
 
@@ -1187,8 +1197,8 @@ static int dev_dma_buffer_map(struct dev_dma_buffer_desc *desc)
 {
 	// map the dma buffers
 	desc->tx_base = dma_map_single(&(sdev->dev), 
-									desc->kaddr + desc->tx_offset,
-									desc->tx_length,
+									desc->kaddr + desc->user_request.tx_offset,
+									desc->user_request.tx_length,
 									DMA_TO_DEVICE);
 	if(desc->tx_base == 0)
 	{
@@ -1197,55 +1207,21 @@ static int dev_dma_buffer_map(struct dev_dma_buffer_desc *desc)
 	}
 
 	desc->rx_base = dma_map_single(&(sdev->dev),
-									desc->kaddr + desc->rx_offset,
-									desc->rx_offset,
+									desc->kaddr + desc->user_request.rx_offset,
+									desc->user_request.rx_offset,
 									DMA_FROM_DEVICE);
 	if(desc->rx_base == 0)
 	{
 		pr_err("Cannot map rx buffer.\n");
 		dma_unmap_single(&(sdev->dev), 
 							desc->tx_base,
-							desc->tx_length,
+							desc->user_request.tx_length,
 							DMA_TO_DEVICE);
 		return -1;
 	}
 	return 0;
 }
 
-static int dev_dma_buffer_start_dma(struct dev_dma_buffer_desc* desc, struct slot_info_t *slot)
-{
-		uint8_t *slot_base = slot->slot_kaddr;
-		uint32_t buf_len = desc->length;
-		int i;
-		// Validate rx and rx parameters
-		if((desc->tx_offset+desc->tx_length > buf_len) || 
-			(desc->rx_offset+desc->rx_length > buf_len) || 
-			(desc->tx_offset == desc->rx_offset) ||
-			((desc->tx_offset<desc->rx_offset) && (desc->tx_offset+desc->tx_length>desc->rx_offset))|| 
-			((desc->rx_offset<desc->tx_offset) && (desc->rx_offset+desc->rx_length>desc->tx_offset))||
-			((desc->tx_base & 0x3F) !=0) || 
-			((desc->rx_base & 0x3F) !=0))
-		{
-			dev_err(misc.this_device,"Invalid dma parameters.\n");
-			return -1;
-		}
-
-		for(i=0;i<8;i+=4)
-			printk("Buffer content %d: 0x%08x\n",i, *((uint32_t*)(desc->kaddr+i)));
-
-		if(dev_dma_buffer_map(desc))
-			return -1;
-
-		dma_start_tx_rx(slot,
-						desc->tx_base,	// tx base
-						desc->rx_base, // rx_base
-						desc->tx_length,				// tx length
-						desc->rx_length					// rx length
-						);	
-		
-		pr_info("Write to %p, data: 0x%08x",slot_base+AXI_DMA_BASE_OFFSET + AXI_DMA_RX_OFFSET + AXI_DMA_LENGTH_OFFSET,desc->rx_length);
-		return 0;		
-}
 	// --------------------- dma buffer subsys end ---------------------//
 
 static void dev_vm_open(struct vm_area_struct * area)
