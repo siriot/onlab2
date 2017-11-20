@@ -10,6 +10,8 @@
 			#size-cells = <1>;
 			ranges ;
 
+			compatible = "fpga_virtual_scheduler";
+
 			fpga_virtual_slots:fpga_virtual_slots{
 				#address-cells = <1>;
 				#size-cells = <1>;

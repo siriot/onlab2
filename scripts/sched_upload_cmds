@@ -1,0 +1,3 @@
+cd /tftpboot
+lcd /home/tibi/onlab2/build
+put main.ko

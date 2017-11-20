@@ -124,7 +124,7 @@ int accel_write(struct accel *acc, uint32_t address, uint32_t data);
  	return	ioctl(acc->fpga_mgr_filedes,(address<<16) | IOCTL_AXI_WRITE,data);
 }
 
-uint32_t accel_read(struct accel *acc, uint32_t address);
+uint32_t accel_read(struct accel *acc, uint32_t address, uint32_t *buf);
 {
 	uint32_t user_addr;
 	// If no slot is owned, return
