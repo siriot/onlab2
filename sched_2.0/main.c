@@ -9,8 +9,6 @@
  *	Not fully perfect things:
  * 		- at module init slot address range should be checked, and should implement correct freeing mechanism
  *
- *		
- 		devtree kiterjesztés + image.ub ujracsomagolása
  		reset bennt lévő slothoz ütemezéskor is
 		dma csatornák interrupt számai(melyik a tx, melyik az rx)
 		slot init errornál bennt maradnak a rossz slotok, nem száll el a modul init
@@ -348,8 +346,8 @@ static irqreturn_t dma_irq_handler(int irq, void *data)
 	uint32_t dma_status;
 
 	dma_status = dma_read(chan, AXI_DMA_STATUS_OFFSET);
-	if((dma_status & (AXI_DMA_DMACR_IOC_IRQ | AXI_DMA_DMACR_ERR_IRQ)) == 0)
-		return IRQ_NONE;
+	if((dma_status & (AXI_DMA_DMACR_IOC_IRQ | AXI_DMA_DMACR_ERR_IRQ)) == 0);
+		//return IRQ_NONE;
 
 	// clear interrupt flag
 	dma_write(chan,AXI_DMA_STATUS_OFFSET, dma_status);
@@ -372,8 +370,7 @@ static int dma_channel_init(struct dma_channel_t *chan, void __iomem * base, int
 	chan->busy = 0;
 	init_completion(&(chan->comp));
 	chan->irq = irq_line;
-	ret = request_irq(irq_line, dma_irq_handler, IRQF_SHARED,
-				  "fpga_sched_dma_irq_hander", chan);
+	ret = request_irq(irq_line, dma_irq_handler, IRQF_TRIGGER_HIGH, "fpga_sched_dma_irq_hander", chan);
 	if(ret)
 		dev_err(sdev,"Cannot request irq line.\n");
 	
@@ -399,12 +396,23 @@ static void dma_channel_irq_disable(struct dma_channel_t *chan)
 	dma_write(chan, AXI_DMA_CONTROL_OFFSET, reg &( ~(AXI_DMA_DMACR_ERR_IRQ | AXI_DMA_DMACR_IOC_IRQ)));
 }
 
+static void dma_channel_irq_clear(struct dma_channel_t *chan)
+{
+	dma_write(chan, AXI_DMA_STATUS_OFFSET, XILINX_DMA_DMASR_ERR_IRQ | XILINX_DMA_DMASR_IOC);
+}
+
+static void dma_irq_enable(struct dma_device_t *dma)
+{
+	dma_channel_irq_enable(&(dma->tx_channel));
+	dma_channel_irq_enable(&(dma->rx_channel));
+}
+
 static int dma_reset(struct dma_device_t *dma)
 {
 	int err;
 	u32 tmp;
 	dma_write(&(dma->tx_channel),AXI_DMA_CONTROL_OFFSET,AXI_DMA_DMACR_RST);
-	err = dma_poll_timeout(dma->tx_channel, AXI_DMA_CONTROL_OFFSET, tmp, ((tmp&AXI_DMA_DMACR_RST)==0),1,1000);
+	err = dma_poll_timeout(dma->tx_channel, AXI_DMA_CONTROL_OFFSET, tmp, ((tmp&AXI_DMA_DMACR_RST)==0),100,5000);
 	return err;
 }
 static int dma_init(struct dma_device_t *dma, uint8_t __iomem *base, int tx_irq, int rx_irq)
@@ -420,7 +428,6 @@ static int dma_init(struct dma_device_t *dma, uint8_t __iomem *base, int tx_irq,
 		dev_err(sdev,"DMA TX IRQ init error.\n");
 		return -1;
 	}
-
 	dma_channel_init(&(dma->rx_channel), dma->base + AXI_DMA_RX_OFFSET, rx_irq);
 	if(ret)
 	{
@@ -428,7 +435,6 @@ static int dma_init(struct dma_device_t *dma, uint8_t __iomem *base, int tx_irq,
 		dma_channel_destroy(&(dma->tx_channel));
 		return -1;
 	}
-
 
 	// reset the dma
 	err = dma_reset(dma);
@@ -438,8 +444,7 @@ static int dma_init(struct dma_device_t *dma, uint8_t __iomem *base, int tx_irq,
 		return -1;
 	}
 	// enable irqs
-	dma_channel_irq_enable(&(dma->tx_channel));
-	dma_channel_irq_enable(&(dma->rx_channel));
+	dma_irq_enable(dma);
 	return 0;
 }
 
@@ -482,15 +487,48 @@ static int dma_wait_channel_ready(struct dma_channel_t *chan)
 	return ret;
 }
 
+static int dma_poll_channel_ready(struct dma_channel_t *chan)
+{
+	int ret;
+	int err;
+	u32 tmp;
+
+	// channel is allready ready
+	if(chan->busy == 0)
+		return 0;
+
+	err = dma_poll_timeout((*chan), AXI_DMA_STATUS_OFFSET, tmp, ((tmp&(XILINX_DMA_DMASR_ERR_IRQ | XILINX_DMA_DMASR_IOC))!=0),1,100000);
+
+	// clear all flags
+	dma_write(chan,AXI_DMA_STATUS_OFFSET,tmp);
+
+	if(err)
+	{
+		dev_err(sdev,"Waiting for dma chanel timeouted.\n");
+		ret = -1;
+	}
+	else if(tmp & XILINX_DMA_DMASR_ERR_IRQ)
+	{
+		dev_err(sdev,"Dma channel error: 0x%08x",tmp);
+		ret = -2;
+	}
+	else ret = 0 ;
+
+	return ret;
+}
+
+
+
 static int dma_start_channel(struct dma_channel_t *chan, uint32_t addr, uint32_t len)
 {
 	uint32_t reg;
-	if(chan->busy == 1)
-		return -1;
+	/*if(chan->busy == 1)
+		return -1;*/
 	chan->busy = 1;
 	reinit_completion(&(chan->comp));
+	printk("Starting dma. addr: 0x%08x, len: %u\n",addr,len);
 	reg = dma_read(chan, AXI_DMA_CONTROL_OFFSET);
-	dma_write8(chan, AXI_DMA_CONTROL_OFFSET,reg | AXI_DMA_DMACR_RS);
+	dma_write(chan, AXI_DMA_CONTROL_OFFSET,reg | AXI_DMA_DMACR_RS);
 	dma_write(chan,  AXI_DMA_ADDRESS_OFFSET, addr);
 	dma_write(chan,  AXI_DMA_LENGTH_OFFSET, len);
 	return 0;
@@ -520,6 +558,33 @@ static int dma_wait_transfer_ready(struct slot_info_t *slot)
 	}
 
 	return ~(tx_ok && rx_ok);
+}
+
+static int dma_poll_transfer_ready(struct slot_info_t *slot)
+{
+	int tx_ok, rx_ok;
+
+	if(dma_poll_channel_ready(&(slot->dma.tx_channel)))
+	{
+		dev_err(sdev,"DMA TX failed.\n");
+		tx_ok = 0;
+	}
+	else
+	{
+		tx_ok = 1;
+	}
+
+	if(dma_poll_channel_ready(&(slot->dma.rx_channel)))
+	{
+		dev_err(sdev,"DMA RX failed.\n");
+		rx_ok = 0;
+	}
+	else 
+	{
+		rx_ok = 1;
+	}
+
+	return (tx_ok && rx_ok)?0:-ETIMEDOUT;
 }
 
 static int dma_start_tx_rx(struct slot_info_t *slot, uint32_t tx_base, uint32_t rx_base, uint32_t tx_len, uint32_t rx_len)
@@ -553,7 +618,8 @@ static int program_slot(int slot_num, int acc_id)
 	// decouple accelerator
 	iowrite8(1, slot_info[slot_num].slot_kaddr + AXI_DECOUPLER_BASE_OFFSET);
 	// reset TX and RX DMA channels
-	dma_reset(&(slot_info[slot_num].dma));
+	if(dma_reset(&(slot_info[slot_num].dma))) pr_err("Cannot reset dma\n");
+	dma_irq_enable(&(slot_info[slot_num].dma));
 
 
 	
@@ -1071,18 +1137,14 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 		}
 			break;
 		case IOCTL_DMA_WAIT_FOR_RDY:
-			if(!lock_operating_vdev(vdev))
+			if(vdev->slot)
 			{
-				ret = dma_wait_transfer_ready(vdev->slot);
+				ret = dma_poll_transfer_ready(vdev->slot);
 				dev_dma_buffer_unmap(vdev->dma_buffer_desc);
-				unlock_operating_vdev(vdev);
+				return ret;
 			}
-			else
-			{
-				pr_err("Accelerator is not working.\n");
-				ret = -ENODEV;
-			}
-			return 0;
+			else 
+				return -ENODEV;
 			break;
 		default:
 			pr_err("Unknown ioctl command code: %u.\n",cmd);
@@ -1177,7 +1239,8 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		if(cntr==0)
 		{
 			// Free the buffer and the descriptor
-			dev_info(misc.this_device,"Freeing coherent dma buffer.\n");
+			dev_dma_buffer_unmap(desc);
+			dev_info(misc.this_device,"Freeing dma buffer.\n");
 			free_page((unsigned long)(desc->kaddr));//dma_free_coherent(NULL, desc->length, desc->kaddr, desc->dma_addr);
 			kfree(desc);		
 		}
@@ -1267,6 +1330,7 @@ static int dev_dma_buffer_map(struct dev_dma_buffer_desc *desc)
 								desc->tx_base,
 								desc->user_request.tx_length,
 								DMA_TO_DEVICE);
+			desc->tx_base = 0;
 			return -1;
 		}
 	}
@@ -1476,7 +1540,7 @@ static int init_slot(struct device_node *of, struct slot_info_t *slot)
 	// allocate static region addresses for the slot
 	if(of_address_to_resource(of,0,&res))
 		goto err;
-	if(request_mem_region(res.start, resource_size(&res), "FPGA ACCELERATOR SLOT") == NULL);
+	if(request_mem_region(res.start, resource_size(&res), "FPGA ACCELERATOR SLOT") == NULL)
 		goto err;
 	slot_kaddr = ioremap(res.start,resource_size(&res));
 	if(!slot_kaddr)
@@ -1621,7 +1685,7 @@ static void print_slot_data(void)
 	{
 		printk("Slot %d\n",i);
 		printk("\tBase address: 0x%08x,\n\tslot address length: 0x%x,\n\tassociated accel num: %d.\n",slot_info[i].base_address, slot_info[i].address_length, slot_info[i].compatible_accel_num);
-		printk("\tCurrent accel name: %s",slot_info[i].actual_dev?slot_info[i].actual_dev->name:" - ");
+		printk("\tCurrent accel name: %s\n",slot_info[i].actual_dev?slot_info[i].actual_dev->name:" - ");
 		for(j=0;j<slot_info[i].compatible_accel_num;j++)
 			printk("\tIt is compatible with accel --%d--.\n",slot_info[i].compatible_accels[j]->acc_id);
 		printk("\tSlot dma:\n");
@@ -1898,11 +1962,19 @@ static int fpga_sched_probe(struct platform_device *pdev)
 	pr_info("Building device modell.\n");
 
 	platform_dev = pdev;
+
+	pr_info("Init FPGA.\n");
+	if(connect_to_fpga_mgr())
+	{
+		pr_err("Cannot init fpga manager.\n");
+		goto err;
+	}
+
 	// set dma bit mask
 	if(build_device_modell(pdev))
 	{
 		pr_err("Cannot build device modell.\n");
-		goto err;
+		goto err1;
 	}
 
 	// build database
@@ -1910,20 +1982,33 @@ static int fpga_sched_probe(struct platform_device *pdev)
 	if(gather_slot_data())
 	{
 		pr_err("Failed to init slot data.\n");
-		goto err1;
+		goto err2;
 	}
+
+
+
+// interrupt probing 
+
+{
+	unsigned long t = probe_irq_on();
+	int i_num;
+	// enable slot 0 tx interrupt
+	dma_irq_enable(&(slot_info[1].dma));
+
+	dma_start_tx_rx(&(slot_info[1]), 0x3d400000, 0x3d500000,64,64);
+	msleep(500);
+
+
+	//dma_channel_irq_disable(&(slot_info[0].dma.tx_channel));
+	i_num = probe_irq_off(t);
+	printk("Interrupt line number: %d\n",i_num);
+}
+
 
 	pr_info("Gathering accel data.\n");
 	if(gather_accel_data())
 	{
 		pr_err("Failed to load accel data.\n");
-		goto err2;
-	}
-
-	pr_info("Connecting to the fpga manager.\n");
-	if(connect_to_fpga_mgr())
-	{
-		pr_err("Cannot init fpga manager.\n");
 		goto err3;
 	}
 
@@ -1954,13 +2039,13 @@ static int fpga_sched_probe(struct platform_device *pdev)
 	err5:
 		misc_deregister(&misc);
 	err4:
-		disconnect_from_fpga_mgr();
-	err3:
 		free_accel_data();
-	err2:
+	err3:
 		free_slot_data();
-	err1:
+	err2:
 		clean_device_modell();
+	err1:
+		disconnect_from_fpga_mgr();
 	err:
 	return -1;
 }

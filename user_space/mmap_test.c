@@ -6,6 +6,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+#include <error.h>
 
 
 // defines
@@ -20,15 +23,15 @@
 // types
 struct user_dma_buffer_desc
 {
-	u32 tx_offset;
-	u32 rx_offset;
-	u32 tx_length;
-	u32 rx_length;
+	uint32_t tx_offset;
+	uint32_t rx_offset;
+	uint32_t tx_length;
+	uint32_t rx_length;
 };
 
 
 // globals
-uint32_t pattern = 0x12121212;
+uint32_t pattern = 0x11223344;
 
 int main(int argc, char **argv)
 {
@@ -42,10 +45,16 @@ int main(int argc, char **argv)
 	f = open("/dev/fpga_mgr", O_RDWR);
 
 	// request accelerator
-	ioctl(f,1,0);
+	ret = ioctl(f,1,1);
+	printf("Accel request retval: %d\n",ret);
+
 
 	tx_buf = mmap(NULL,1024,PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
-
+	if(!tx_buf)
+	{
+		printf("MMAP failed\n");
+		return -1;
+	}
 	memset(tx_buf,0,128);
 
 	for(i=0;i<64;i+=4)
@@ -58,14 +67,15 @@ int main(int argc, char **argv)
 	rqst.tx_length = 64;
 	rqst.rx_offset = 64;
 	rqst.rx_length = 64;
-	ioctl(f,IOCTL_DMA_START,&rqst);
+	ret = ioctl(f,IOCTL_DMA_START,&rqst);
+	printf("DMA start response: %d\n",ret);
 
 	sleep(1);
 
 	// wait for dma ready
 	ret = ioctl(f,IOCTL_DMA_WAIT_FOR_RDY,0);
 	if(ret)
-		printf("Wait for dma error code: %s"strerror(ret));
+		printf("Wait for dma error code: %s\n",strerror(ret));
 
 	// read
 	rx_buf = tx_buf + 64;
