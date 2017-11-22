@@ -106,6 +106,7 @@ struct slot_info_t
 	uint32_t address_length;
 
 	struct dma_device_t dma;		// corresponding dma device
+	int user_irq;
 
 	// compatible accelerator list
 	uint32_t compatible_accel_num;
@@ -346,8 +347,8 @@ static irqreturn_t dma_irq_handler(int irq, void *data)
 	uint32_t dma_status;
 
 	dma_status = dma_read(chan, AXI_DMA_STATUS_OFFSET);
-	if((dma_status & (AXI_DMA_DMACR_IOC_IRQ | AXI_DMA_DMACR_ERR_IRQ)) == 0);
-		//return IRQ_NONE;
+	if((dma_status & (AXI_DMA_DMACR_IOC_IRQ | AXI_DMA_DMACR_ERR_IRQ)) == 0)
+		return IRQ_NONE;
 
 	// clear interrupt flag
 	dma_write(chan,AXI_DMA_STATUS_OFFSET, dma_status);
@@ -522,8 +523,8 @@ static int dma_poll_channel_ready(struct dma_channel_t *chan)
 static int dma_start_channel(struct dma_channel_t *chan, uint32_t addr, uint32_t len)
 {
 	uint32_t reg;
-	/*if(chan->busy == 1)
-		return -1;*/
+	if(chan->busy == 1)
+		return -1;
 	chan->busy = 1;
 	reinit_completion(&(chan->comp));
 	printk("Starting dma. addr: 0x%08x, len: %u\n",addr,len);
@@ -554,10 +555,10 @@ static int dma_wait_transfer_ready(struct slot_info_t *slot)
 	}
 	else 
 	{
-		tx_ok = 1;
+		rx_ok = 1;
 	}
 
-	return ~(tx_ok && rx_ok);
+	return (tx_ok && rx_ok)?0:-ETIMEDOUT;
 }
 
 static int dma_poll_transfer_ready(struct slot_info_t *slot)
@@ -1139,7 +1140,7 @@ static long dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 		case IOCTL_DMA_WAIT_FOR_RDY:
 			if(vdev->slot)
 			{
-				ret = dma_poll_transfer_ready(vdev->slot);
+				ret = dma_wait_transfer_ready(vdev->slot);
 				dev_dma_buffer_unmap(vdev->dma_buffer_desc);
 				return ret;
 			}
@@ -1554,6 +1555,7 @@ static int init_slot(struct device_node *of, struct slot_info_t *slot)
 	// request irq lines
 	tx_irq = irq_of_parse_and_map(of, 0);
 	rx_irq = irq_of_parse_and_map(of, 1);
+	slot->user_irq = irq_of_parse_and_map(of, 2);
 
 	// init slot dma
 	if(dma_init(&(slot->dma),slot_kaddr + AXI_DMA_BASE_OFFSET, tx_irq, rx_irq))
@@ -1988,7 +1990,7 @@ static int fpga_sched_probe(struct platform_device *pdev)
 
 
 // interrupt probing 
-
+/*
 {
 	unsigned long t = probe_irq_on();
 	int i_num;
@@ -2003,7 +2005,7 @@ static int fpga_sched_probe(struct platform_device *pdev)
 	i_num = probe_irq_off(t);
 	printk("Interrupt line number: %d\n",i_num);
 }
-
+*/
 
 	pr_info("Gathering accel data.\n");
 	if(gather_accel_data())

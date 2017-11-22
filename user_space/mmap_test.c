@@ -61,7 +61,6 @@ int main(int argc, char **argv)
 		memcpy(&tx_buf[i],&pattern,4);
 	msync(tx_buf,64,MS_SYNC);
 
-	sleep(1);
 	// start dma transfer
 	rqst.tx_offset = 0;
 	rqst.tx_length = 64;
@@ -69,8 +68,6 @@ int main(int argc, char **argv)
 	rqst.rx_length = 64;
 	ret = ioctl(f,IOCTL_DMA_START,&rqst);
 	printf("DMA start response: %d\n",ret);
-
-	sleep(1);
 
 	// wait for dma ready
 	ret = ioctl(f,IOCTL_DMA_WAIT_FOR_RDY,0);
