@@ -1,0 +1,3 @@
+cd /tftpboot/scripts
+lcd ../build
+put sched_user

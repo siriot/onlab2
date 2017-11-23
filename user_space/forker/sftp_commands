@@ -1,3 +1,0 @@
-cd /tftpboot
-lcd ~/onlab/sched_user/sched_user
-put user_main

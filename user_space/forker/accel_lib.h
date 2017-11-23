@@ -18,6 +18,7 @@
 
 #include <sys/mman.h>
 
+
 struct accel
 {
 	char *name;
@@ -31,22 +32,21 @@ struct accel
 	int fpga_mgr_filedes;
 };
 
-enum timestamps {ACCEL_OPEN_START,ACCEL_OPEN_END,SLOT_GET_START,SLOT_GET_END,SLOT_RELEASE_START,SLOT_RELEASE_END,MAX_INDEX};
-
 
 struct accel *accel_open(const char *acc_name);
 void accel_close(struct accel *acc);
 
-int accel_write(struct accel *acc, uint32_t address, uint32_t data);
-uint32_t accel_read(struct accel *acc, uint32_t address);
+long accel_write(struct accel *acc, uint32_t address, uint32_t data);
+long accel_read(struct accel *acc, uint32_t address, uint32_t *buf);
 
 uint8_t * accel_map(struct accel *acc, uint32_t buffer_size);
 void accel_unmap(struct accel *acc);
 
+
 // ioctl operations
-int fpga_getlock(struct accel *acc, struct timespec *time_array);
-int fpga_unlock(struct accel *acc,  struct timespec *time_array);
-int accel_start_dma(struct accel *acc, unsigned int tx_offset, unsigned int tx_length, unsigned int rx_offset, unsigned int rx_length);
-int accel_wait_dma_rdy(struct accel *acc);
+long fpga_getlock(struct accel *acc);
+long fpga_unlock(struct accel *acc);
+long accel_start_dma(struct accel *acc, unsigned int tx_offset, unsigned int tx_length, unsigned int rx_offset, unsigned int rx_length);
+long accel_wait_dma_rdy(struct accel *acc);
 
 #endif /* ACCEL_LIB_H_ */
