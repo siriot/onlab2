@@ -20,7 +20,7 @@
 
 #define CONFIG_NUM 2
 #define SEM_NAME "test_sem"
-#define CYCLE_NUM 5
+#define CYCLE_NUM 15
 
 
 struct timing_data_t{
@@ -55,7 +55,13 @@ sem_t *sem;
 
 
 int run_child(int no);
-
+/*
+int main(int argc, char **argv)
+{
+	run_child(1);
+	return 0;
+}
+*/
 int main(int argc, char **argv)
 {
 	int i;
@@ -154,6 +160,7 @@ int run_child(int no)
 
 	// child
 	//wait for start signal
+	
 	sem = sem_open(SEM_NAME,0);
 	if(!sem)
 	{
@@ -179,7 +186,6 @@ int run_child(int no)
 		fclose(log);
 		return -1;
 	}
-
 	clock_gettime(CLOCK_MONOTONIC_RAW,&(timing_data.mmap_start));
 	mmap_addr = accel_map(acc,4096);
 	clock_gettime(CLOCK_MONOTONIC_RAW,&(timing_data.mmap_end));
@@ -195,9 +201,9 @@ int run_child(int no)
 		clock_gettime(CLOCK_MONOTONIC_RAW,&(timing_data.get_start[i]));
 		ret = fpga_getlock(acc);
 		clock_gettime(CLOCK_MONOTONIC_RAW,&(timing_data.get_end[i]));
-		if(ret)
+		if(ret<0)
 		{
-			fprintf(stderr,"Error at fpga locking.\n");
+			fprintf(stderr,"Error at fpga lockin, retval = %ld\n",ret);
 			break;
 		}
 
@@ -209,9 +215,11 @@ int run_child(int no)
 		fpga_unlock(acc);
 		clock_gettime(CLOCK_MONOTONIC_RAW,&(timing_data.release_end[i]));
 		
-		usleep(WAIT_TIME);
+		//usleep(WAIT_TIME);
 	}
 }
+
+sleep(2);
 
 
 /* ACCEL USAGE END */
@@ -276,6 +284,7 @@ int process_copy(struct accel *acc, struct timespec *dma_start,struct timespec *
 		tx_buffer[i] = p ^ 0x00AA5500;
 		p<<=1;
 	}
+
 	clock_gettime(CLOCK_MONOTONIC_RAW,dma_start);
 	ret = accel_start_dma(acc, 0, 1024, BUFFER_LEN_BYTE/2, 1024);
 	if(ret) fprintf(stderr,"DMA START RETURN VALUE: %d.\n",ret);
@@ -286,7 +295,7 @@ int process_copy(struct accel *acc, struct timespec *dma_start,struct timespec *
 	//check data correctness
 	for(i=0;i<1024;i++)
 	{
-		if(rb[i] != tb[i&0xFFFFFFC0]) fprintf(stderr,"Data error at byte %d.\n",i);
+		if(rb[i] != tb[i&0xFFFFFFF8]) fprintf(stderr,"Data error at byte %d.\n",i);
 	}
 	return 0;
 
@@ -317,9 +326,9 @@ int process_swapper(struct accel *acc, struct timespec *dma_start,struct timespe
 	//check data correctness
 	for(i=0;i<1024;i++)
 	{
-		uint32_t packet_base = i & 0xFFFFFFC0;
-		uint32_t byte_index = i &  0x00000040;
-		if(rb[i] != tb[packet_base + 63-byte_index]) fprintf(stderr,"Data error at byte %d.\n",i);
+		uint32_t packet_base = i & 0xFFFFFFF8;
+		uint32_t byte_index = i &  0x00000007;
+		if(rb[i] != tb[packet_base + 7-byte_index]) fprintf(stdout,"Data error at byte %d.\n",i);
 	}
 	return 0;
 }

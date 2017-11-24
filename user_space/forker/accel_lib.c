@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
+#include <errno.h>
 
 
 #define IOCTL_RELEASE 			0
@@ -52,7 +53,7 @@ struct accel *accel_open(const char *acc_name)
 		return NULL;
 	}
 
-	mgr_file = open(FPGA_MGR_FILE,O_RDONLY);
+	mgr_file = open(FPGA_MGR_FILE,O_RDWR);
 	if(mgr_file == -1)
 	{
 		free(acc);
@@ -135,9 +136,12 @@ uint8_t * accel_map(struct accel *acc, uint32_t buffer_size)
 {
 	assert(acc);
 	uint32_t *b;
-	if(acc->slot_id == -1) return NULL;
-
-	b = (uint32_t*)mmap(NULL,buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, acc->fpga_mgr_filedes, 0);
+	b = (uint32_t *)mmap(NULL,buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, acc->fpga_mgr_filedes, 0);
+	if(b == MAP_FAILED)
+	{
+		printf("MMAP operation failed. Error: %s\n",strerror(errno));
+		return NULL;
+	}
 	acc->mmap_buffer = b;
 	if(b)
 		acc->mmap_buffer_length = 4096;

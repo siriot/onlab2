@@ -35,6 +35,7 @@
 #include <linux/of.h>
 #include <linux/byteorder/generic.h>
 #include <linux/interrupt.h>
+#include <linux/ktime.h>
 
 #include <linux/fpga/fpga-mgr.h>
 #include <linux/of.h>
@@ -287,6 +288,11 @@ struct user_event
 	static struct device fpga_virtual_bus;
 	static struct device *devices;
 
+// fpga configuration length
+	#define CONFIG_LEN_STORAGE_SIZE	16
+	s64 config_length[CONFIG_LEN_STORAGE_SIZE];
+	int config_length_idx;
+	s64 static_config_time;
 	
 	/***************************************
 		Internal functions
@@ -600,15 +606,27 @@ static int dma_start_tx_rx(struct slot_info_t *slot, uint32_t tx_base, uint32_t 
 //#devcfgapi
 static int program_fpga(const char *name)
 {
+	ktime_t start, finish;
+	s64 delta;
+
 	uint32_t ret;
 	// load the fpga with the static configuration
+	start = ktime_get();
 	ret = fpga_mgr_firmware_load(mgr, 0, name);
+	finish = ktime_get();
+	delta = ktime_us_delta(finish,start);
+	static_config_time = delta;
 	if(ret)
 		pr_err("Cannot initialize static fpga_region.\n");
 	return ret;
 }
+
+
 static int program_slot(int slot_num, int acc_id)
 {
+	ktime_t start, finish;
+	s64 delta;
+
 	int ret;
 	char config_file_name[100];
 
@@ -627,7 +645,16 @@ static int program_slot(int slot_num, int acc_id)
 	snprintf(config_file_name,100,"%s_slot%d.bit",device_data[acc_id].name,slot_num);
 	// start programming
 	pr_info("Loading configuration: %s - id :%d.\n",config_file_name,acc_id);
+	start = ktime_get();
 	ret = fpga_mgr_firmware_load(mgr, FPGA_MGR_PARTIAL_RECONFIG, config_file_name);
+	finish = ktime_get();
+	delta = ktime_us_delta(finish, start);
+
+	config_length_idx%=16;
+	config_length[config_length_idx] = delta;
+	config_length_idx++;
+
+
 	pr_info("FPGA configuration finished.\n");
 	if(ret)
 	{
@@ -1265,7 +1292,7 @@ static int dev_close (struct inode *inode, struct file *pfile)
 		}
 		
 		// Create descriptor for the dma buffer
-		desc = kmalloc(MMAP_MAX_BUFFER_LENGTH,GFP_KERNEL);
+		desc = kmalloc(sizeof(struct dev_dma_buffer_desc) ,GFP_KERNEL);
 		if(!desc)
 		{
 			// rewind coherent allocation
@@ -1390,6 +1417,7 @@ static int dev_mmap (struct file *pfile, struct vm_area_struct *vma)
 		buf_desc = dev_dma_buffer_alloc(MMAP_MAX_BUFFER_LENGTH);
 		if(!buf_desc)
 		{
+			dev_err(sdev,"Cannot allocate dma bufer.\n");
 			return -ENOMEM;
 		}
 		vdev->dma_buffer_desc = buf_desc;
@@ -1667,6 +1695,16 @@ static void free_slot_data(void)
 							DEBUG DUMP FUNCTIONS
 
    ========================================================================*/
+
+static void print_config_times(void)
+{
+	int i;
+	pr_info("Static config length: %lld\n",(long long)(static_config_time));
+	pr_info("Partial configuration lengths:\n");
+	for(i=0;i<CONFIG_LEN_STORAGE_SIZE;i++)
+		pr_info("\t%lld\n",(long long)(config_length[i]));
+}
+
 static void print_channel_data(struct dma_channel_t *chan)
 {
 	printk("\t\t\tInterrupt line: %d, base address: %p.\n",chan->irq, chan->base);
@@ -1941,6 +1979,7 @@ static void procfs_destroy(void)
 ssize_t procfile_read(struct file *file, char __user *buffer, size_t bufsize, loff_t * offset)
 {
 	print_slot_data();	
+	print_config_times();
 	return 0;
 }
 

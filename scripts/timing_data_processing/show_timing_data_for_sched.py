@@ -8,7 +8,7 @@ import numpy.random as rnd
 import urllib2
 
 download = False
-filename= 'sum15.txt'
+filename= 'sum.txt'
 
 	#downloading the data file
 	
