@@ -36,6 +36,7 @@
 #include <linux/byteorder/generic.h>
 #include <linux/interrupt.h>
 #include <linux/ktime.h>
+#include <linux/workqueue.h>
 
 #include <linux/fpga/fpga-mgr.h>
 #include <linux/of.h>
@@ -93,7 +94,12 @@ struct dev_priv
 };
 struct virtual_dev_t;
 
-enum slot_status_t {SLOT_FREE, SLOT_USED};
+struct slot_config_job{
+	struct work_struct work;
+	int acc_id;
+};
+
+enum slot_status_t {SLOT_FREE, SLOT_USED, SLOT_CONFIGURING};
 struct slot_info_t
 {
 	struct virtual_dev_t *user;
@@ -112,6 +118,9 @@ struct slot_info_t
 	// compatible accelerator list
 	uint32_t compatible_accel_num;
 	struct dev_priv **compatible_accels;
+
+	// slot pgrogramming work
+	struct slot_config_job config_job;
 };
 
 /* 	Buffer descpriptor format.
@@ -270,6 +279,7 @@ struct user_event
 
 //fpga manager data
 	static struct fpga_manager *mgr;
+	struct workqueue_struct *fpga_wq;
 
 // fpga slot data
 	DEFINE_SPINLOCK(slot_lock);
@@ -622,27 +632,28 @@ static int program_fpga(const char *name)
 }
 
 
-static int program_slot(int slot_num, int acc_id)
+static void program_slot(struct work_struct *work)
 {
+	struct slot_config_job *job = container_of(work, struct slot_config_job, work);
+	struct slot_info_t *slot = container_of(job, struct slot_info_t,  config_job);
+	int acc_id = job->acc_id;
 	ktime_t start, finish;
 	s64 delta;
 
 	int ret;
 	char config_file_name[100];
-
-	if(slot_num < 0 || slot_num >= SLOT_NUM) return -1;
 	// stop the previous accelerator
 	// reset accelerator
-	iowrite8(1,slot_info[slot_num].slot_kaddr + AXI_RST_BASE_OFFSET);
+	iowrite8(1,slot->slot_kaddr + AXI_RST_BASE_OFFSET);
 	// decouple accelerator
-	iowrite8(1, slot_info[slot_num].slot_kaddr + AXI_DECOUPLER_BASE_OFFSET);
+	iowrite8(1, slot->slot_kaddr + AXI_DECOUPLER_BASE_OFFSET);
 	// reset TX and RX DMA channels
-	if(dma_reset(&(slot_info[slot_num].dma))) pr_err("Cannot reset dma\n");
-	dma_irq_enable(&(slot_info[slot_num].dma));
+	if(dma_reset(&(slot->dma))) pr_err("Cannot reset dma\n");
+	dma_irq_enable(&(slot->dma));
 
 
 	
-	snprintf(config_file_name,100,"%s_slot%d.bit",device_data[acc_id].name,slot_num);
+	snprintf(config_file_name,100,"%s_slot%d.bit",device_data[acc_id].name,slot-slot_info);
 	// start programming
 	pr_info("Loading configuration: %s - id :%d.\n",config_file_name,acc_id);
 	start = ktime_get();
@@ -664,13 +675,28 @@ static int program_slot(int slot_num, int acc_id)
 	{
 		// starting the new accelerator
 		// clear decoupling
-		iowrite8(0, slot_info[slot_num].slot_kaddr + AXI_DECOUPLER_BASE_OFFSET);
+		iowrite8(0, slot->slot_kaddr + AXI_DECOUPLER_BASE_OFFSET);
 		// clear reset signal
-		iowrite8(0,slot_info[slot_num].slot_kaddr + AXI_RST_BASE_OFFSET);
+		iowrite8(0,slot->slot_kaddr + AXI_RST_BASE_OFFSET);
 	}
-	return ret;
+	slot->actual_dev = &device_data[acc_id];
+	spin_lock(&slot_lock);
+	slot->status = SLOT_FREE;
+	spin_unlock(&slot_lock);
+	complete(&event_in);
+	return;
 }
 
+static int start_slot_programming(int slot_num, int acc_id)
+{
+	struct slot_info_t *slot = &slot_info[slot_num];
+	slot->config_job.acc_id = acc_id;
+	INIT_WORK(&(slot->config_job.work),program_slot);
+	queue_work(fpga_wq,&(slot->config_job.work));
+	slot->status = SLOT_CONFIGURING;
+	return 0;
+
+}
 
 
 	//------------------------------------------------------------//
@@ -787,36 +813,8 @@ static void hw_schedule(void)
 				// serve the selected request
 				if(vdev)
 				{
-					list_del_init(&(vdev->waiter_list));
-
-					// start slot programming
-					if(!program_slot(i,d->acc_id))
-					{
-						// programming succeeded
-						spin_lock(&(vdev->status_lock));
-						spin_lock(&slot_lock);
-						slot_info[i].status = SLOT_USED;
-						slot_info[i].actual_dev = d;
-						slot_info[i].user = vdev;
-						free_slot_num--;
-						vdev->status = DEV_STATUS_OPERATING;
-						vdev->slot = &slot_info[i];
-						spin_unlock(&slot_lock);
-						spin_unlock(&(vdev->status_lock));
-						pr_info("Starting process %d for slot: %d, with accel: %d.\n",vdev->user?vdev->user->pid:-1,i,d->acc_id);
-					}
-					else
-					{
-						// programming failed
-						spin_lock(&(vdev->status_lock));
-						vdev->status = DEV_STATUS_BLANK;
-						vdev->slot = NULL;
-						spin_unlock(&(vdev->status_lock));
-						pr_err("FPGA programming failed for slot %d with accel %d.\n",i,d->acc_id);
-					}
-
-					// start waiter process
-					complete(&(vdev->compl));
+					// device found, so start programing the slot
+					start_slot_programming(i, d->acc_id);
 				}
 			}
 			spin_lock(&slot_lock);
@@ -1938,6 +1936,15 @@ static int connect_to_fpga_mgr(void)
 		ret = -ENODEV;
 	}
 
+	fpga_wq = create_singlethread_workqueue("FPGA programmer workqueue");
+	if(!fpga_wq)
+	{
+		fpga_mgr_put(mgr);
+		pr_err("Cannot create fpgram programmer workqueue.\n");
+		mgr = NULL;
+		return -ENOMEM;
+	}
+
 	// program fpga with the static config
 	pr_info("Loading static FPGA configuration.\n");
 	ret = program_fpga(FPGA_STATIC_CONFIG_NAME);
@@ -1948,6 +1955,11 @@ err:
 
 static void disconnect_from_fpga_mgr(void)
 {
+	if(fpga_wq)
+	{
+		flush_workqueue(fpga_wq);
+		destroy_workqueue(fpga_wq);
+	}
 	if(mgr)
 		fpga_mgr_put(mgr);
 }
